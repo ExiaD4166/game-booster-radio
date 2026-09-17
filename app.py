@@ -98,10 +98,22 @@ class App(ctk.CTk):
 
         self._build_left_pane()
         self._build_right_pane_placeholder()
+        self._recover_from_previous_crash()
 
         self.stats_monitor.start()
         self.after(STATS_REFRESH_MS, self._poll_stats)
         self.protocol("WM_DELETE_WINDOW", self._on_close)
+
+    def _recover_from_previous_crash(self) -> None:
+        """Undo a leftover boost from a run that never got to restore_defaults()."""
+        leftover = optimizer.find_crash_leftover_state()
+        if leftover is None:
+            return
+        restored = optimizer.recover_from_leftover_state(leftover)
+        self.status_label.configure(
+            text=f"Recovered from an earlier session — restored {restored} processes.",
+            text_color=COLOR_WARNING,
+        )
 
     # ---------------------------------------------------------------- layout
 

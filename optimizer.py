@@ -8,15 +8,23 @@ it never touches the network and has no effect on any other user.
 from __future__ import annotations
 
 import ctypes
+import json
 import logging
+import os
 import sys
 import threading
 from dataclasses import dataclass, field
+from pathlib import Path
 
 import psutil
 
 if sys.platform != "win32":
     raise RuntimeError("optimizer.py uses Windows-only APIs and can only run on Windows.")
+
+# Where the crash-recovery record lives: outside the project folder, since a
+# packaged .exe may run from a read-only install location.
+STATE_DIR = Path(os.environ.get("LOCALAPPDATA", os.path.expanduser("~"))) / "GameBoosterRadio"
+STATE_FILE = STATE_DIR / "boost_state.json"
 
 logger = logging.getLogger(__name__)
 
@@ -39,6 +47,76 @@ class BoostState:
 # Tracks the one boost currently in effect, so a second call can't overwrite
 # original_priorities with values that are already lowered.
 _active_state: BoostState | None = None
+
+
+def _save_state_file(state: BoostState) -> None:
+    """Persist the boost record to disk so a crash doesn't lose it.
+
+    Written after lowering processes so a crash any time after that point —
+    including one this program can't catch — leaves a record the next launch
+    can find and undo. It won't protect against a crash mid-scan, but that
+    window is a fraction of a second; this covers the much longer time the
+    boost actually stays active.
+    """
+    try:
+        STATE_DIR.mkdir(parents=True, exist_ok=True)
+        STATE_FILE.write_text(
+            json.dumps(
+                {
+                    "game_pid": state.game_pid,
+                    "dedicated_cores": state.dedicated_cores,
+                    "original_priorities": state.original_priorities,
+                }
+            )
+        )
+    except OSError as exc:
+        logger.warning("Could not save boost state file: %s", exc)
+
+
+def _clear_state_file() -> None:
+    try:
+        STATE_FILE.unlink(missing_ok=True)
+    except OSError as exc:
+        logger.warning("Could not remove boost state file: %s", exc)
+
+
+def find_crash_leftover_state() -> dict | None:
+    """Check for a boost record a previous, crashed run left behind.
+
+    Call this once at app startup, before doing anything else. Returns the
+    raw record from disk, or None if there's nothing to recover.
+    """
+    if not STATE_FILE.exists():
+        return None
+    try:
+        return json.loads(STATE_FILE.read_text())
+    except (OSError, json.JSONDecodeError) as exc:
+        logger.warning("Could not read leftover boost state file: %s", exc)
+        return None
+
+
+def recover_from_leftover_state(leftover: dict) -> int:
+    """Restore priorities recorded in a crash-leftover state file.
+
+    Returns how many background processes were successfully restored.
+    """
+    try:
+        game_proc = psutil.Process(leftover["game_pid"])
+        game_proc.nice(psutil.NORMAL_PRIORITY_CLASS)
+        game_proc.cpu_affinity(list(range(psutil.cpu_count(logical=True) or 1)))
+    except (psutil.NoSuchProcess, psutil.AccessDenied, KeyError):
+        pass
+
+    restored = 0
+    for pid_str, original_priority in leftover.get("original_priorities", {}).items():
+        try:
+            psutil.Process(int(pid_str)).nice(original_priority)
+            restored += 1
+        except (psutil.NoSuchProcess, psutil.AccessDenied, ValueError):
+            continue
+
+    _clear_state_file()
+    return restored
 
 
 def find_process_by_name(exe_name: str) -> psutil.Process | None:
@@ -128,6 +206,7 @@ def optimize_for_game(exe_name: str, core_count: int = 2) -> BoostState | None:
         exe_name, game_proc.pid, game_cores, len(state.original_priorities),
     )
     _active_state = state
+    _save_state_file(state)
     return state
 
 
@@ -149,6 +228,7 @@ def restore_defaults(state: BoostState) -> None:
 
     if _active_state is state:
         _active_state = None
+    _clear_state_file()
 
 
 @dataclass
@@ -242,6 +322,7 @@ class BoostMaintainer:
 
     def _sweep_new_processes(self) -> None:
         own_pid = psutil.Process().pid
+        caught_any = False
         for proc in psutil.process_iter(["pid", "name"]):
             pid = proc.info["pid"]
             if (
@@ -253,8 +334,12 @@ class BoostMaintainer:
                 continue
             try:
                 _deprioritize(proc, self.state)
+                caught_any = True
             except (psutil.NoSuchProcess, psutil.AccessDenied):
                 continue
+
+        if caught_any:
+            _save_state_file(self.state)
 
 
 if __name__ == "__main__":
