@@ -10,6 +10,7 @@ from __future__ import annotations
 import ctypes
 import logging
 import sys
+import threading
 from dataclasses import dataclass, field
 
 import psutil
@@ -65,6 +66,18 @@ def trim_working_set(pid: int) -> bool:
         ctypes.windll.kernel32.CloseHandle(handle)
 
 
+def _deprioritize(proc: psutil.Process, state: BoostState) -> None:
+    """Record a process's current priority, lower it, and trim its RAM.
+
+    Raises psutil.NoSuchProcess/AccessDenied for the caller to catch — a process
+    can exit mid-scan, or belong to another user, at any time.
+    """
+    pid = proc.pid
+    state.original_priorities[pid] = proc.nice()
+    proc.nice(psutil.BELOW_NORMAL_PRIORITY_CLASS)
+    trim_working_set(pid)
+
+
 def optimize_for_game(exe_name: str, core_count: int = 2) -> BoostState | None:
     """Boost `exe_name` and deprioritize everything else on this PC.
 
@@ -106,9 +119,7 @@ def optimize_for_game(exe_name: str, core_count: int = 2) -> BoostState | None:
             continue
 
         try:
-            state.original_priorities[pid] = proc.nice()
-            proc.nice(psutil.BELOW_NORMAL_PRIORITY_CLASS)
-            trim_working_set(pid)
+            _deprioritize(proc, state)
         except (psutil.NoSuchProcess, psutil.AccessDenied):
             continue
 
@@ -138,6 +149,112 @@ def restore_defaults(state: BoostState) -> None:
 
     if _active_state is state:
         _active_state = None
+
+
+@dataclass
+class SystemStats:
+    """One snapshot of system-wide resource usage."""
+
+    cpu_percent: float
+    ram_percent: float
+    ram_used_gb: float
+    ram_total_gb: float
+
+
+def get_system_stats() -> SystemStats:
+    """Take a single, cheap snapshot of system-wide CPU and RAM usage."""
+    ram = psutil.virtual_memory()
+    return SystemStats(
+        cpu_percent=psutil.cpu_percent(interval=None),
+        ram_percent=ram.percent,
+        ram_used_gb=ram.used / (1024 ** 3),
+        ram_total_gb=ram.total / (1024 ** 3),
+    )
+
+
+class StatsMonitor:
+    """Polls system CPU/RAM on a background thread; callers read get_latest()."""
+
+    def __init__(self, interval_seconds: float = 1.0):
+        self.interval_seconds = interval_seconds
+        self._latest: SystemStats | None = None
+        self._lock = threading.Lock()
+        self._stop_event = threading.Event()
+        self._thread: threading.Thread | None = None
+
+    def start(self) -> None:
+        if self._thread is not None:
+            return
+        psutil.cpu_percent(interval=None)  # prime the baseline; first real reading follows
+        self._stop_event.clear()
+        self._thread = threading.Thread(target=self._run, daemon=True)
+        self._thread.start()
+
+    def stop(self) -> None:
+        self._stop_event.set()
+        if self._thread is not None:
+            self._thread.join(timeout=2)
+            self._thread = None
+
+    def get_latest(self) -> SystemStats | None:
+        with self._lock:
+            return self._latest
+
+    def _run(self) -> None:
+        while not self._stop_event.is_set():
+            stats = get_system_stats()
+            with self._lock:
+                self._latest = stats
+            self._stop_event.wait(self.interval_seconds)
+
+
+class BoostMaintainer:
+    """While a boost is active, periodically lowers newly-spawned processes too.
+
+    optimize_for_game() only sees processes that exist at the moment it's called.
+    A browser opening a new tab five minutes later would spawn at normal
+    priority otherwise — this catches those on a slower, cheaper-average cadence.
+    """
+
+    def __init__(self, state: BoostState, interval_seconds: float = 5.0):
+        self.state = state
+        self.interval_seconds = interval_seconds
+        self._stop_event = threading.Event()
+        self._thread: threading.Thread | None = None
+
+    def start(self) -> None:
+        if self._thread is not None:
+            return
+        self._stop_event.clear()
+        self._thread = threading.Thread(target=self._run, daemon=True)
+        self._thread.start()
+
+    def stop(self) -> None:
+        self._stop_event.set()
+        if self._thread is not None:
+            self._thread.join(timeout=2)
+            self._thread = None
+
+    def _run(self) -> None:
+        while not self._stop_event.is_set():
+            self._sweep_new_processes()
+            self._stop_event.wait(self.interval_seconds)
+
+    def _sweep_new_processes(self) -> None:
+        own_pid = psutil.Process().pid
+        for proc in psutil.process_iter(["pid", "name"]):
+            pid = proc.info["pid"]
+            if (
+                pid in RESERVED_PIDS
+                or pid == self.state.game_pid
+                or pid == own_pid
+                or pid in self.state.original_priorities
+            ):
+                continue
+            try:
+                _deprioritize(proc, self.state)
+            except (psutil.NoSuchProcess, psutil.AccessDenied):
+                continue
 
 
 if __name__ == "__main__":
