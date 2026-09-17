@@ -5,6 +5,7 @@ psutil==7.2.2          # process priority/affinity control, CPU & RAM stats
 customtkinter==6.0.0    # modern dark-themed desktop UI
 darkdetect==0.8.0       # OS theme detection (customtkinter dependency)
 packaging==26.3         # version parsing (customtkinter dependency)
+pillow==12.3.0          # draws the app's custom icons (CTkImage requires it)
 websockets==17.1        # WebSocket server/client for the sync radio
 yt-dlp==2026.8.19       # extract audio-only streams from YouTube
 python-vlc==3.0.21203   # audio playback bindings (requires VLC installed on the system)
