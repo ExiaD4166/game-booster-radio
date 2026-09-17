@@ -1,0 +1,30 @@
+# Python
+__pycache__/
+*.pyc
+*.pyo
+
+# Virtual environment
+.venv/
+venv/
+env/
+
+# Packaging output
+build/
+dist/
+*.spec
+
+# Secrets / environment config
+.env
+
+# Logs
+*.log
+
+# Editor/OS junk
+.vscode/
+.idea/
+Thumbs.db
+.DS_Store
+
+# Private learning docs (not for the public repo)
+LEARNING_ROADMAP.md
+LEARNING_CONCEPTS.md
