@@ -878,7 +878,10 @@ class App(ctk.CTk):
             )
             self._set_button_state(self.track_action_button, "normal" if is_admin else "disabled", "Sync for Everyone")
             self._set_button_state(self.play_pause_button, "normal" if is_admin else "disabled")
-            self._set_button_state(self.skip_button, "normal" if is_admin else "disabled")
+            self._set_button_state(
+                self.skip_button,
+                "normal" if is_admin and state.get("queue_length", 0) > 1 else "disabled",
+            )
         else:
             if self._is_synced_playback:
                 self.radio_player.stop()

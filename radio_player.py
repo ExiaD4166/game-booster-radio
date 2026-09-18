@@ -86,34 +86,37 @@ def extract_audio_url(youtube_url: str) -> dict:
     }
 
 
-def _is_playlist_only_url(url: str) -> bool:
-    """True for a link that points at a playlist with no specific video.
+def _playlist_id(url: str) -> str | None:
+    """The playlist id in a link, or None if it shouldn't be expanded.
 
-    A link like '.../watch?v=X&list=Y' (a video that happens to sit inside
-    a playlist) should still play just that one video — that's the existing,
-    expected single-track behavior. Only a link with no 'v' param (e.g. the
-    playlist page itself, '.../playlist?list=Y') means "play the whole
-    playlist," so only that case is expanded.
+    Covers both a playlist page ('.../playlist?list=Y') and a video that sits
+    inside one ('.../watch?v=X&list=Y' — what you get copying the address bar
+    while a playlist is playing). YouTube "Mix" lists (ids starting 'RD') are
+    auto-generated, personalized and endless, so those stay single-video.
     """
-    query = parse_qs(urlparse(url).query)
-    return "list" in query and "v" not in query
+    ids = parse_qs(urlparse(url).query).get("list")
+    if not ids or ids[0].startswith("RD"):
+        return None
+    return ids[0]
 
 
 def resolve_track_urls(url: str) -> list[str]:
     """Resolve a pasted link to one or more individual, single-video URLs.
 
-    A normal video link resolves to itself, unchanged, with no network
-    call. A playlist-only link (see _is_playlist_only_url) is expanded to
-    every video it contains, via yt-dlp's flat extraction — this only reads
-    the playlist's own page (video IDs/titles), it does not resolve each
-    video's actual audio stream, so it's fast even for a long playlist.
+    A plain video link resolves to itself with no network call. A link that
+    carries a playlist id is expanded to every video in that playlist via
+    yt-dlp's flat extraction (it only reads the playlist page — ids and
+    titles — not each video's audio stream, so it's fast even for long
+    lists). If the link also names a specific video, the queue is rotated to
+    START at that video (then continues through the rest and wraps around).
     Each returned URL is later resolved individually by extract_audio_url()
-    exactly like a link the user pasted directly, only when it's actually
-    that track's turn to play.
+    only when it's actually that track's turn to play.
     """
-    if not _is_playlist_only_url(url):
+    playlist_id = _playlist_id(url)
+    if playlist_id is None:
         return [url]
 
+    pasted_video = parse_qs(urlparse(url).query).get("v", [None])[0]
     ydl_opts = {
         "quiet": True,
         "no_warnings": True,
@@ -122,28 +125,29 @@ def resolve_track_urls(url: str) -> list[str]:
     }
     try:
         with yt_dlp.YoutubeDL(ydl_opts) as ydl:
-            info = ydl.extract_info(url, download=False)
+            info = ydl.extract_info(
+                f"https://www.youtube.com/playlist?list={playlist_id}", download=False
+            )
+        entries = info.get("entries") if info else None
     except yt_dlp.utils.DownloadError as exc:
+        if pasted_video:
+            return [url]  # playlist unreadable (private?) — still play the video
         raise ExtractionError(f"Could not read playlist '{url}': {exc}") from exc
 
-    entries = info.get("entries") if info else None
-    if not entries:
+    ids: list[str] = []
+    for entry in entries or []:
+        if entry and entry.get("id"):
+            ids.append(entry["id"])
+
+    if not ids:
+        if pasted_video:
+            return [url]
         raise ExtractionError(f"'{url}' doesn't look like a playlist with any videos.")
 
-    urls: list[str] = []
-    for entry in entries:
-        if not entry:
-            continue
-        entry_url = entry.get("url") or entry.get("webpage_url") or entry.get("id")
-        if not entry_url:
-            continue
-        if not entry_url.startswith("http"):
-            entry_url = f"https://www.youtube.com/watch?v={entry_url}"
-        urls.append(entry_url)
-
-    if not urls:
-        raise ExtractionError(f"Playlist '{url}' has no playable videos.")
-    return urls
+    if pasted_video in ids:
+        start = ids.index(pasted_video)
+        ids = ids[start:] + ids[:start]
+    return [f"https://www.youtube.com/watch?v={video_id}" for video_id in ids]
 
 
 class RadioPlayer:
