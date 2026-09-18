@@ -8,10 +8,9 @@ __pycache__/
 venv/
 env/
 
-# Packaging output
+# Packaging output (the .spec file itself IS committed — it's the build recipe)
 build/
 dist/
-*.spec
 
 # Secrets / environment config
 .env

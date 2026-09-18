@@ -1,0 +1,4 @@
+# Only needed by whoever packages the app into a .exe — not a runtime
+# dependency of app.py itself, so it's kept out of requirements.txt.
+
+pyinstaller==6.22.3

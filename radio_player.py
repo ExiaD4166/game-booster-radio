@@ -11,6 +11,23 @@ call its caller is responsible for threading.
 from __future__ import annotations
 
 import logging
+import os
+import sys
+from pathlib import Path
+
+if getattr(sys, "frozen", False):
+    # Running from a PyInstaller-built .exe: point python-vlc at the bundled
+    # copy of libvlc instead of letting it search the system (a friend
+    # running the packaged app won't have VLC installed at all). These two
+    # environment variables are exactly what vlc.py's find_lib() checks
+    # first, before falling back to the registry/PATH search — and it does
+    # that check at import time, so this must run before `import vlc` below.
+    # sys._MEIPASS is where PyInstaller actually places bundled data/binaries
+    # in this version's onedir layout (an _internal/ folder next to the exe,
+    # not the exe's own directory — confirmed by inspecting the built output).
+    _vlc_runtime = Path(getattr(sys, "_MEIPASS", Path(sys.executable).parent)) / "vlc_runtime"
+    os.environ.setdefault("PYTHON_VLC_LIB_PATH", str(_vlc_runtime / "libvlc.dll"))
+    os.environ.setdefault("PYTHON_VLC_MODULE_PATH", str(_vlc_runtime / "plugins"))
 
 import vlc
 import yt_dlp
