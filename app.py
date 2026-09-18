@@ -263,8 +263,8 @@ class FadeButton(ctk.CTkButton):
         self._leave_job = None
         super().__init__(master, *args, hover=False, **kwargs)
         self._shown = self._resolve(self._base)
-        self.bind("<Enter>", self._on_enter)
-        self.bind("<Leave>", self._on_leave)
+        self.bind("<Enter>", self._fade_enter)
+        self.bind("<Leave>", self._fade_leave)
 
     def _resolve(self, color) -> str:
         if isinstance(color, (tuple, list)):
@@ -306,7 +306,10 @@ class FadeButton(ctk.CTkButton):
 
         step()
 
-    def _on_enter(self, _event=None) -> None:
+    # NOTE: these must NOT be named _on_enter/_on_leave. Those are CTkButton's own
+    # internals: its click handler only fires the command if its _on_enter set
+    # the "mouse is inside" flag, so overriding them silently kills real clicks.
+    def _fade_enter(self, _event=None) -> None:
         if self._leave_job is not None:
             self.after_cancel(self._leave_job)
             self._leave_job = None
@@ -315,12 +318,12 @@ class FadeButton(ctk.CTkButton):
         self._hovering = True
         self._fade(self._resolve(self.cget("hover_color")))
 
-    def _on_leave(self, _event=None) -> None:
+    def _fade_leave(self, _event=None) -> None:
         # Moving between the button's inner widgets fires Leave immediately
         # followed by Enter; the short delay stops that flickering.
-        self._leave_job = self.after(35, self._finish_leave)
+        self._leave_job = self.after(35, self._fade_finish_leave)
 
-    def _finish_leave(self) -> None:
+    def _fade_finish_leave(self) -> None:
         self._leave_job = None
         if self._hovering:
             self._hovering = False
@@ -414,6 +417,7 @@ class ScrollableDropdown(ctk.CTkFrame):
         self._values: list[str] = list(values or [])
         self._selected = self._values[0] if self._values else ""
         self._popup: ctk.CTkToplevel | None = None
+        self._last_closed = 0.0
         self._font = font
         self._text_color = text_color
         self._dropdown_fg_color = dropdown_fg_color or fg_color
@@ -455,6 +459,8 @@ class ScrollableDropdown(ctk.CTkFrame):
     def _toggle_popup(self) -> None:
         if self._popup is not None:
             self._close_popup()
+        elif time.monotonic() - self._last_closed < 0.3:
+            return  # this very click just closed the list (it took the focus first)
         else:
             self._open_popup()
 
@@ -498,6 +504,7 @@ class ScrollableDropdown(ctk.CTkFrame):
         if self._popup is not None:
             self._popup.destroy()
             self._popup = None
+            self._last_closed = time.monotonic()
 
     def _pick(self, value: str) -> None:
         self.set(value)
