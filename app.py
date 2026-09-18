@@ -303,6 +303,8 @@ class App(ctk.CTk):
         self._users_list_snapshot: tuple | None = None
         self._last_drift_correction = 0.0
         self._auto_skip_track_url: str | None = None
+        self._local_queue: list[str] = []
+        self._local_queue_index: int = 0
 
         self._build_left_pane()
         self._build_right_pane()
@@ -487,6 +489,11 @@ class App(ctk.CTk):
             updates["text"] = text
         if updates:
             button.configure(**updates)
+
+    def _set_local_skip_button_state(self) -> None:
+        """Skip only makes sense locally once there's more than one track to
+        move to — a lone personal video has nowhere to skip forward to."""
+        self._set_button_state(self.skip_button, "normal" if len(self._local_queue) > 1 else "disabled")
 
     def _build_right_pane(self) -> None:
         # A plain frame, matching the left pane's proven layout pattern —
@@ -853,6 +860,8 @@ class App(ctk.CTk):
                 self.radio_player.stop()
                 self._is_synced_playback = False
                 self._loaded_track_url = None
+                self._local_queue = []
+                self._local_queue_index = 0
                 self.track_label.configure(text="No track loaded.")
 
             self._set_sync_badge("🎧 LOCAL PLAYER MODE", COLOR_ACCENT_LIGHT, COLOR_BADGE_BG_ACCENT)
@@ -861,7 +870,7 @@ class App(ctk.CTk):
                 self.track_action_button, "normal", "Sync for Everyone" if is_admin else "Play Locally"
             )
             self._set_button_state(self.play_pause_button, "normal" if self._loaded_track_url else "disabled")
-            self._set_button_state(self.skip_button, "disabled")
+            self._set_local_skip_button_state()
 
     def _correct_drift(self, server_position: float) -> None:
         if self.radio_player.is_buffering():
@@ -906,16 +915,34 @@ class App(ctk.CTk):
                 self.sync_client.send({"type": "set_playlist", "urls": urls})
             return
 
+        if kind == "local_playlist_resolved":
+            # Same shape as "playlist_resolved" above, but for personal
+            # playback: no server involved, so the resolved URLs become a
+            # purely client-side queue that Skip/auto-play walk through
+            # locally, independent of anyone else's admin stream.
+            urls = info
+            self._is_synced_playback = False
+            self._local_queue = urls
+            self._local_queue_index = 0
+            self._loaded_track_url = urls[0]
+            self._start_load_track(urls[0], seek_to=0.0, autoplay=True)
+            return
+
         if kind == "load_done":
             self.track_label.configure(text=f"Now playing: {info['title']}")
             if seek_to:
                 self.radio_player.seek(seek_to)
             if autoplay:
                 self.radio_player.play()
-            # Only the icon changes here — whether the button is ENABLED is
-            # decided solely by _apply_sync_state's role check, so a track
-            # finishing load can never itself re-enable a locked-out control.
             self.play_pause_button.configure(text="⏸ Pause" if autoplay else "▶ Play")
+            if not self._is_synced_playback:
+                # A locally-driven load (no admin stream involved) — this is
+                # the only client controlling it, so it's always fine to
+                # enable these here. A synced load's button state is instead
+                # decided solely by _apply_sync_state's role check on its own
+                # poll tick, so this stays out of the way of that gating.
+                self._set_button_state(self.play_pause_button, "normal")
+                self._set_local_skip_button_state()
         elif kind == "load_failed":
             logger.warning("Track load failed: %s", error)
             self.track_label.configure(
@@ -923,6 +950,10 @@ class App(ctk.CTk):
             )
             self._is_synced_playback = False
             self._loaded_track_url = None
+            self._local_queue = []
+            self._local_queue_index = 0
+            self._set_button_state(self.play_pause_button, "disabled")
+            self._set_local_skip_button_state()
 
     def _on_track_action_clicked(self) -> None:
         url = self.track_entry.get().strip()
@@ -938,10 +969,36 @@ class App(ctk.CTk):
             self.track_entry.delete(0, "end")
             self._resolve_and_sync_playlist(url)
         elif not sync_active:
-            self._is_synced_playback = False
-            self._loaded_track_url = url
-            self._start_load_track(url, seek_to=0.0, autoplay=True)
             self.track_entry.delete(0, "end")
+            self._resolve_and_play_locally(url)
+
+    def _resolve_and_play_locally(self, url: str) -> None:
+        """Expand a playlist link (if it is one) into a personal queue.
+
+        Purely client-side — nothing here touches the server, so this is
+        available with or without a connection at all. A plain single-video
+        link resolves to a one-track "queue" with no network call (see
+        resolve_track_urls), same as before this queue concept existed.
+        """
+        self.track_label.configure(text=f"Loading '{url}'...")
+
+        def worker() -> None:
+            try:
+                urls = radio_player.resolve_track_urls(url)
+                self._track_load_queue.put(("local_playlist_resolved", urls, None, None, None))
+            except radio_player.ExtractionError as exc:
+                self._track_load_queue.put(("load_failed", None, None, None, str(exc)))
+
+        threading.Thread(target=worker, daemon=True).start()
+        self.after(QUEUE_POLL_MS, self._poll_track_load_queue)
+
+    def _advance_local_queue(self) -> None:
+        if len(self._local_queue) < 2:
+            return
+        self._local_queue_index = (self._local_queue_index + 1) % len(self._local_queue)
+        next_url = self._local_queue[self._local_queue_index]
+        self._loaded_track_url = next_url
+        self._start_load_track(next_url, seek_to=0.0, autoplay=True)
 
     def _resolve_and_sync_playlist(self, url: str) -> None:
         """Expand a playlist link to its videos, then sync the whole thing.
@@ -978,8 +1035,11 @@ class App(ctk.CTk):
                 self.play_pause_button.configure(text="⏸ Pause")
 
     def _on_skip_clicked(self) -> None:
-        if self.sync_client is not None:
+        state = self.sync_client.get_latest_state() if self.sync_client else None
+        if state and state.get("your_role") == "admin" and state.get("sync_active"):
             self.sync_client.send({"type": "skip"})
+        else:
+            self._advance_local_queue()
 
     def _on_promote_clicked(self, user_id: int) -> None:
         if self.sync_client is not None:
