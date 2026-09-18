@@ -5,6 +5,9 @@ your active game priority over background apps, paired with a synchronized radio
 you and your friends can listen to the same YouTube audio stream together while you
 play — without touching video decoding or adding noticeable CPU/RAM overhead.
 
+**[⬇ Download the latest release](https://github.com/ExiaD4166/game-booster-radio/releases/latest)**
+— no Python or VLC install needed, just extract and run `GameBoosterRadio.exe`.
+
 ![Game Booster & Radio Center](assets/screenshot.png)
 
 ## What it does
