@@ -144,6 +144,136 @@ def _ensure_app_icon() -> Path:
     return ICON_PATH
 
 
+def _format_bytes(n: int) -> str:
+    """Human-readable memory size, e.g. 512 MB or 1.3 GB."""
+    gb = n / (1024 ** 3)
+    if gb >= 1:
+        return f"{gb:.1f} GB"
+    return f"{n / (1024 ** 2):.0f} MB"
+
+
+class ScrollableDropdown(ctk.CTkFrame):
+    """A combo-box-style picker with a real, visible scrollbar in its popup.
+
+    CTkComboBox's built-in dropdown is a native OS menu (tkinter.Menu) —
+    with a long process list it *does* overflow-scroll on Windows, but only
+    via tiny, easy-to-miss arrow hotspots at the very top/bottom, no visible
+    scrollbar. This swaps that popup for a CTkToplevel containing a
+    CTkScrollableFrame, which has an actual scrollbar track plus mouse-wheel
+    support, and reads/writes the same way a combo box would (get/set/
+    configure(values=...)) so call sites don't need to change.
+    """
+
+    def __init__(
+        self,
+        master,
+        values: list[str] | None = None,
+        height: int = 36,
+        font: ctk.CTkFont | None = None,
+        fg_color: str | None = None,
+        border_color: str | None = None,
+        text_color: str | None = None,
+        button_color: str | None = None,
+        button_hover_color: str | None = None,
+        dropdown_fg_color: str | None = None,
+        dropdown_hover_color: str | None = None,
+    ) -> None:
+        super().__init__(master, fg_color="transparent")
+        self.grid_columnconfigure(0, weight=1)
+
+        self._values: list[str] = list(values or [])
+        self._selected = self._values[0] if self._values else ""
+        self._popup: ctk.CTkToplevel | None = None
+        self._font = font
+        self._text_color = text_color
+        self._dropdown_fg_color = dropdown_fg_color or fg_color
+        self._dropdown_hover_color = dropdown_hover_color or button_color
+
+        self._display = ctk.CTkButton(
+            self, text=self._selected or "—", height=height, corner_radius=8,
+            font=font, fg_color=fg_color, hover_color=fg_color, text_color=text_color,
+            border_width=1, border_color=border_color, anchor="w",
+            command=self._toggle_popup,
+        )
+        self._display.grid(row=0, column=0, sticky="ew")
+
+        self._arrow = ctk.CTkButton(
+            self, text="▾", width=28, height=height, corner_radius=8, font=font,
+            fg_color=button_color, hover_color=button_hover_color, text_color=text_color,
+            command=self._toggle_popup,
+        )
+        self._arrow.grid(row=0, column=1, padx=(4, 0))
+
+    def get(self) -> str:
+        return self._selected
+
+    def set(self, value: str) -> None:
+        self._selected = value
+        self._display.configure(text=value or "—")
+
+    def configure(self, **kwargs) -> None:
+        if "values" in kwargs:
+            self._values = list(kwargs.pop("values") or [])
+        if kwargs:
+            super().configure(**kwargs)
+
+    def cget(self, attribute_name: str):
+        if attribute_name == "values":
+            return list(self._values)
+        return super().cget(attribute_name)
+
+    def _toggle_popup(self) -> None:
+        if self._popup is not None:
+            self._close_popup()
+        else:
+            self._open_popup()
+
+    def _open_popup(self) -> None:
+        if not self._values:
+            return
+
+        self.update_idletasks()
+        x = self._display.winfo_rootx()
+        y = self._display.winfo_rooty() + self._display.winfo_height() + 2
+        width = self._display.winfo_width() + self._arrow.winfo_width() + 4
+        row_height = 32
+        popup_height = min(len(self._values) * row_height + 16, 320)
+
+        popup = ctk.CTkToplevel(self)
+        popup.overrideredirect(True)
+        popup.geometry(f"{width}x{popup_height}+{x}+{y}")
+        popup.attributes("-topmost", True)
+        self._popup = popup
+
+        scroll_frame = ctk.CTkScrollableFrame(
+            popup, fg_color=self._dropdown_fg_color, corner_radius=6,
+        )
+        scroll_frame.pack(fill="both", expand=True, padx=1, pady=1)
+        scroll_frame.grid_columnconfigure(0, weight=1)
+
+        for i, value in enumerate(self._values):
+            row = ctk.CTkButton(
+                scroll_frame, text=value, height=row_height - 4, corner_radius=4,
+                font=self._font, fg_color="transparent", hover_color=self._dropdown_hover_color,
+                text_color=self._text_color, anchor="w",
+                command=lambda v=value: self._pick(v),
+            )
+            row.grid(row=i, column=0, sticky="ew", pady=1)
+
+        popup.bind("<FocusOut>", lambda _e: self._close_popup())
+        popup.bind("<Escape>", lambda _e: self._close_popup())
+        popup.after(50, lambda: popup.focus_force())
+
+    def _close_popup(self) -> None:
+        if self._popup is not None:
+            self._popup.destroy()
+            self._popup = None
+
+    def _pick(self, value: str) -> None:
+        self.set(value)
+        self._close_popup()
+
+
 class App(ctk.CTk):
     def __init__(self) -> None:
         super().__init__()
@@ -162,6 +292,7 @@ class App(ctk.CTk):
         self.boost_state: optimizer.BoostState | None = None
         self.boost_maintainer: optimizer.BoostMaintainer | None = None
         self._boost_queue: queue.Queue = queue.Queue()
+        self._process_name_by_display: dict[str, str] = {}
 
         self.sync_client: sync_client.SyncClient | None = None
         self.radio_player = radio_player.RadioPlayer(volume=70)
@@ -171,6 +302,7 @@ class App(ctk.CTk):
         self._track_load_queue: queue.Queue = queue.Queue()
         self._users_list_snapshot: tuple | None = None
         self._last_drift_correction = 0.0
+        self._auto_skip_track_url: str | None = None
 
         self._build_left_pane()
         self._build_right_pane()
@@ -235,11 +367,10 @@ class App(ctk.CTk):
         selector_row.grid(row=2, column=0, sticky="ew", padx=20, pady=4)
         selector_row.grid_columnconfigure(0, weight=1)
 
-        self.game_dropdown = ctk.CTkComboBox(
+        self.game_dropdown = ScrollableDropdown(
             selector_row,
             values=["(click Refresh)"],
             height=36,
-            corner_radius=8,
             font=ctk.CTkFont(family=FONT, size=13),
             fg_color=COLOR_SURFACE,
             border_color=COLOR_BORDER,
@@ -509,16 +640,28 @@ class App(ctk.CTk):
     # ------------------------------------------------------------- game list
 
     def _refresh_process_list(self) -> None:
-        names = sorted(
-            {
-                p.info["name"]
-                for p in psutil.process_iter(["name"])
-                if p.info["name"] and p.info["name"].lower().endswith(".exe")
-            }
-        )
-        self.game_dropdown.configure(values=names or ["(no processes found)"])
-        if names:
-            self.game_dropdown.set(names[0])
+        # Sorted heaviest-memory-first: a game is almost always the single
+        # biggest RAM consumer running, so this puts it right at the top
+        # instead of making the user hunt for it alphabetically. Processes
+        # sharing a name (e.g. several chrome.exe helper processes) have
+        # their memory summed, so multi-process apps rank by their true
+        # total footprint rather than one arbitrary instance's share of it.
+        memory_by_name: dict[str, int] = {}
+        for p in psutil.process_iter(["name", "memory_info"]):
+            name = p.info["name"]
+            if not name or not name.lower().endswith(".exe"):
+                continue
+            mem = p.info["memory_info"]
+            memory_by_name[name] = memory_by_name.get(name, 0) + (mem.rss if mem else 0)
+
+        ranked = sorted(memory_by_name.items(), key=lambda pair: pair[1], reverse=True)
+        self._process_name_by_display = {
+            f"{name}   ({_format_bytes(mem)})": name for name, mem in ranked
+        }
+        display_values = list(self._process_name_by_display)
+        self.game_dropdown.configure(values=display_values or ["(no processes found)"])
+        if display_values:
+            self.game_dropdown.set(display_values[0])
 
     # ------------------------------------------------------------ boost flow
 
@@ -529,10 +672,11 @@ class App(ctk.CTk):
             self._start_boost()
 
     def _start_boost(self) -> None:
-        target = self.game_dropdown.get()
-        if not target or target.startswith("("):
+        selection = self.game_dropdown.get()
+        if not selection or selection.startswith("("):
             self.status_label.configure(text="Pick a running .exe first.", text_color=COLOR_WARNING)
             return
+        target = self._process_name_by_display.get(selection, selection)
 
         self.boost_button.configure(
             state="disabled", text="Boosting...", fg_color=COLOR_BUSY, hover_color=COLOR_BUSY
@@ -676,15 +820,27 @@ class App(ctk.CTk):
             if track_url and (not self._is_synced_playback or track_url != self._loaded_track_url):
                 self._is_synced_playback = True
                 self._loaded_track_url = track_url
+                self._auto_skip_track_url = None
                 self._start_load_track(
                     track_url, seek_to=server_position, autoplay=server_is_playing and self.radio_on
                 )
             elif self._is_synced_playback and self.radio_on:
-                if server_is_playing and not self.radio_player.is_playing():
-                    self.radio_player.play()
-                elif not server_is_playing and self.radio_player.is_playing():
-                    self.radio_player.pause()
-                self._correct_drift(server_position)
+                # A playlist track that's played through to the end looks the
+                # same to VLC as one that's simply paused (is_playing() is
+                # False either way) — checked first so the block below
+                # doesn't try to restart the just-ended track from the top
+                # instead of letting it advance to the next one.
+                ended = self.radio_player.is_ended()
+                if is_admin and ended and state.get("queue_length", 0) > 1:
+                    if self._auto_skip_track_url != self._loaded_track_url:
+                        self._auto_skip_track_url = self._loaded_track_url
+                        self.sync_client.send({"type": "skip"})
+                else:
+                    if server_is_playing and not self.radio_player.is_playing() and not ended:
+                        self.radio_player.play()
+                    elif not server_is_playing and self.radio_player.is_playing():
+                        self.radio_player.pause()
+                    self._correct_drift(server_position)
 
             self._set_track_entry_mode(
                 is_admin, "Paste a YouTube link..." if is_admin else "An admin stream is live"
@@ -740,6 +896,16 @@ class App(ctk.CTk):
             self.after(QUEUE_POLL_MS, self._poll_track_load_queue)
             return
 
+        if kind == "playlist_resolved":
+            # The "info" slot carries the resolved list[str] of URLs here
+            # instead of the usual extract_audio_url() info dict — this
+            # message only ever comes from _resolve_and_sync_playlist(),
+            # never from _start_load_track(), so there's no ambiguity.
+            urls = info
+            if self.sync_client is not None:
+                self.sync_client.send({"type": "set_playlist", "urls": urls})
+            return
+
         if kind == "load_done":
             self.track_label.configure(text=f"Now playing: {info['title']}")
             if seek_to:
@@ -769,13 +935,35 @@ class App(ctk.CTk):
         sync_active = bool(state and state.get("sync_active"))
 
         if is_admin:
-            self.sync_client.send({"type": "set_playlist", "urls": [url]})
             self.track_entry.delete(0, "end")
+            self._resolve_and_sync_playlist(url)
         elif not sync_active:
             self._is_synced_playback = False
             self._loaded_track_url = url
             self._start_load_track(url, seek_to=0.0, autoplay=True)
             self.track_entry.delete(0, "end")
+
+    def _resolve_and_sync_playlist(self, url: str) -> None:
+        """Expand a playlist link to its videos, then sync the whole thing.
+
+        A plain single-video link resolves to itself with no network call
+        (see resolve_track_urls), so this adds no delay for the common
+        case — only an actual playlist link takes the extra round trip.
+        Runs on a background thread for the same reason _start_load_track
+        does: it may be a real network request, and blocking the GUI
+        thread on one would freeze the whole window.
+        """
+        self.track_label.configure(text=f"Loading '{url}'...")
+
+        def worker() -> None:
+            try:
+                urls = radio_player.resolve_track_urls(url)
+                self._track_load_queue.put(("playlist_resolved", urls, None, None, None))
+            except radio_player.ExtractionError as exc:
+                self._track_load_queue.put(("load_failed", None, None, None, str(exc)))
+
+        threading.Thread(target=worker, daemon=True).start()
+        self.after(QUEUE_POLL_MS, self._poll_track_load_queue)
 
     def _on_play_pause_clicked(self) -> None:
         state = self.sync_client.get_latest_state() if self.sync_client else None

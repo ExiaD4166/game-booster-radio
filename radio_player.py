@@ -14,6 +14,7 @@ import logging
 import os
 import sys
 from pathlib import Path
+from urllib.parse import parse_qs, urlparse
 
 if getattr(sys, "frozen", False):
     # Running from a PyInstaller-built .exe: point python-vlc at the bundled
@@ -85,6 +86,66 @@ def extract_audio_url(youtube_url: str) -> dict:
     }
 
 
+def _is_playlist_only_url(url: str) -> bool:
+    """True for a link that points at a playlist with no specific video.
+
+    A link like '.../watch?v=X&list=Y' (a video that happens to sit inside
+    a playlist) should still play just that one video — that's the existing,
+    expected single-track behavior. Only a link with no 'v' param (e.g. the
+    playlist page itself, '.../playlist?list=Y') means "play the whole
+    playlist," so only that case is expanded.
+    """
+    query = parse_qs(urlparse(url).query)
+    return "list" in query and "v" not in query
+
+
+def resolve_track_urls(url: str) -> list[str]:
+    """Resolve a pasted link to one or more individual, single-video URLs.
+
+    A normal video link resolves to itself, unchanged, with no network
+    call. A playlist-only link (see _is_playlist_only_url) is expanded to
+    every video it contains, via yt-dlp's flat extraction — this only reads
+    the playlist's own page (video IDs/titles), it does not resolve each
+    video's actual audio stream, so it's fast even for a long playlist.
+    Each returned URL is later resolved individually by extract_audio_url()
+    exactly like a link the user pasted directly, only when it's actually
+    that track's turn to play.
+    """
+    if not _is_playlist_only_url(url):
+        return [url]
+
+    ydl_opts = {
+        "quiet": True,
+        "no_warnings": True,
+        "logger": _SilentYtDlpLogger(),
+        "extract_flat": "in_playlist",
+    }
+    try:
+        with yt_dlp.YoutubeDL(ydl_opts) as ydl:
+            info = ydl.extract_info(url, download=False)
+    except yt_dlp.utils.DownloadError as exc:
+        raise ExtractionError(f"Could not read playlist '{url}': {exc}") from exc
+
+    entries = info.get("entries") if info else None
+    if not entries:
+        raise ExtractionError(f"'{url}' doesn't look like a playlist with any videos.")
+
+    urls: list[str] = []
+    for entry in entries:
+        if not entry:
+            continue
+        entry_url = entry.get("url") or entry.get("webpage_url") or entry.get("id")
+        if not entry_url:
+            continue
+        if not entry_url.startswith("http"):
+            entry_url = f"https://www.youtube.com/watch?v={entry_url}"
+        urls.append(entry_url)
+
+    if not urls:
+        raise ExtractionError(f"Playlist '{url}' has no playable videos.")
+    return urls
+
+
 class RadioPlayer:
     """Controls one audio-only stream via VLC.
 
@@ -133,6 +194,10 @@ class RadioPlayer:
         than react to a stale or about-to-jump reading.
         """
         return self._player.get_state() in (vlc.State.Buffering, vlc.State.Opening)
+
+    def is_ended(self) -> bool:
+        """True once VLC has played a loaded track through to its end."""
+        return self._player.get_state() == vlc.State.Ended
 
     def get_position_seconds(self) -> float:
         return max(self._player.get_time(), 0) / 1000.0
