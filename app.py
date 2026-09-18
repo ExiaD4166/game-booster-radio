@@ -9,6 +9,7 @@ from __future__ import annotations
 import logging
 import queue
 import threading
+import time
 from pathlib import Path
 
 import customtkinter as ctk
@@ -27,7 +28,17 @@ ctk.set_default_color_theme("dark-blue")
 STATS_REFRESH_MS = 1000
 QUEUE_POLL_MS = 100
 SYNC_POLL_MS = 500
-DRIFT_THRESHOLD_SECONDS = 1.5
+# A real network audio stream needs more tolerance than a plain number
+# might suggest: VLC periodically buffers, and during that window position
+# doesn't advance even though the server's wall-clock position keeps
+# ticking. 1.5s (closer to the original spec figure) fired constantly
+# against normal buffering blips, and since a network seek itself takes a
+# moment to settle, back-to-back corrections could overshoot and undershoot
+# repeatedly, audible as constant forward/backward skipping. Loosened to
+# 3.0s, and paired with a cooldown so a just-issued correction has time to
+# actually take effect before another one can fire.
+DRIFT_THRESHOLD_SECONDS = 3.0
+DRIFT_CORRECTION_COOLDOWN_SECONDS = 6.0
 DEFAULT_SERVER_URI = "ws://localhost:8765"
 
 ASSETS_DIR = Path(__file__).parent / "assets"
@@ -159,6 +170,7 @@ class App(ctk.CTk):
         self._is_synced_playback = False
         self._track_load_queue: queue.Queue = queue.Queue()
         self._users_list_snapshot: tuple | None = None
+        self._last_drift_correction = 0.0
 
         self._build_left_pane()
         self._build_right_pane()
@@ -685,9 +697,17 @@ class App(ctk.CTk):
             self._set_button_state(self.skip_button, "disabled")
 
     def _correct_drift(self, server_position: float) -> None:
+        if self.radio_player.is_buffering():
+            return  # position reading is unreliable mid-buffer; don't chase it
+
+        now = time.monotonic()
+        if now - self._last_drift_correction < DRIFT_CORRECTION_COOLDOWN_SECONDS:
+            return  # give the last correction time to actually settle first
+
         local_position = self.radio_player.get_position_seconds()
         if abs(local_position - server_position) > DRIFT_THRESHOLD_SECONDS:
             self.radio_player.seek(server_position)
+            self._last_drift_correction = now
 
     def _start_load_track(self, url: str, seek_to: float = 0.0, autoplay: bool = True) -> None:
         self.track_label.configure(text=f"Loading '{url}'...")

@@ -124,6 +124,16 @@ class RadioPlayer:
     def is_playing(self) -> bool:
         return bool(self._player.is_playing())
 
+    def is_buffering(self) -> bool:
+        """True while VLC is buffering or opening a stream.
+
+        Position reporting during this window is unreliable (it can stall
+        or jump once buffering finishes), so callers doing drift correction
+        should skip measuring/correcting entirely while this is true rather
+        than react to a stale or about-to-jump reading.
+        """
+        return self._player.get_state() in (vlc.State.Buffering, vlc.State.Opening)
+
     def get_position_seconds(self) -> float:
         return max(self._player.get_time(), 0) / 1000.0
 
