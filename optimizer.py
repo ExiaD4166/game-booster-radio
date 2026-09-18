@@ -12,7 +12,9 @@ import json
 import logging
 import os
 import sys
+import tempfile
 import threading
+import time
 from dataclasses import dataclass, field
 from pathlib import Path
 
@@ -259,6 +261,116 @@ def optimize_for_game(exe_name: str, core_count: int = 2) -> BoostState | None:
     _active_state = state
     _save_state_file(state)
     return state
+
+
+# A locked file (still held open by a running process) is NOT the only
+# thing that makes a temp file "still in use" — plenty of software writes a
+# temp file, closes the handle, and reads it back by path later without
+# ever holding it open (this very CLI tool's own background-task output
+# files work that way, and a first version of this cleanup deleted one out
+# from under a live session because of it). File locking alone can't detect
+# that, so anything younger than this is left alone regardless — only a
+# file nobody has touched in a full day is safe to call actual abandoned
+# junk. Matches the same default Windows' own Storage Sense uses.
+MIN_TEMP_FILE_AGE_SECONDS = 24 * 60 * 60
+
+
+def _delete_path(path: Path, cutoff_time: float) -> tuple[int, int]:
+    """Best-effort delete of one file, or the old-enough contents of one
+    directory tree.
+
+    Returns (files_removed, bytes_freed). Only files last modified before
+    `cutoff_time` are touched — anything newer is left alone untouched, on
+    the assumption a currently-running app may still care about it (see
+    MIN_TEMP_FILE_AGE_SECONDS). A directory is only removed once every file
+    in it has either been old enough to delete or wasn't there to begin
+    with; one with any recent file left inside simply stays.
+
+    Anything locked by a running process or owned by another account
+    (SYSTEM, in C:\\Windows\\Temp) just raises OSError on that one item —
+    skipped silently rather than failing the whole cleanup, since that's
+    the normal, expected case for a shared temp folder, not a real error.
+    """
+    removed = 0
+    freed = 0
+
+    if path.is_symlink():
+        try:
+            if path.lstat().st_mtime < cutoff_time:
+                path.unlink()
+                removed += 1
+        except OSError:
+            pass
+        return removed, freed
+
+    if path.is_dir():
+        for root, dirs, files in os.walk(path, topdown=False):
+            root_path = Path(root)
+            for name in files:
+                try:
+                    file_path = root_path / name
+                    st = file_path.stat()
+                    if st.st_mtime >= cutoff_time:
+                        continue
+                    file_path.unlink()
+                    removed += 1
+                    freed += st.st_size
+                except OSError:
+                    pass
+            for name in dirs:
+                try:
+                    (root_path / name).rmdir()  # only succeeds once empty
+                except OSError:
+                    pass
+        try:
+            path.rmdir()  # only succeeds once every file above was removed
+        except OSError:
+            pass
+    else:
+        try:
+            st = path.stat()
+            if st.st_mtime < cutoff_time:
+                path.unlink()
+                removed += 1
+                freed += st.st_size
+        except OSError:
+            pass
+
+    return removed, freed
+
+
+def clear_temp_folders(min_age_seconds: float = MIN_TEMP_FILE_AGE_SECONDS) -> dict:
+    """Best-effort delete of old-enough files inside the temp folders,
+    never the folders themselves — Windows expects them to keep existing.
+
+    Two roots: the current user's own temp folder (tempfile.gettempdir(),
+    normally AppData\\Local\\Temp — fully owned by this account, so it
+    clears completely) and the system-wide C:\\Windows\\Temp, shared with
+    services and other accounts. This app runs unelevated, so files there
+    it doesn't own simply fail to delete and are skipped — by design, not
+    worth an admin-elevation prompt just for a partial extra cleanup.
+    """
+    cutoff_time = time.time() - min_age_seconds
+    roots = [
+        Path(tempfile.gettempdir()),
+        Path(os.environ.get("SystemRoot", r"C:\Windows")) / "Temp",
+    ]
+
+    total_removed = 0
+    total_freed = 0
+    for root in roots:
+        if not root.is_dir():
+            continue
+        try:
+            entries = list(root.iterdir())
+        except OSError:
+            continue
+        for entry in entries:
+            removed, freed = _delete_path(entry, cutoff_time)
+            total_removed += removed
+            total_freed += freed
+
+    return {"files_removed": total_removed, "bytes_freed": total_freed}
 
 
 def _reset_unrecorded_stragglers(known_pids: set[int]) -> None:

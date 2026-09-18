@@ -145,11 +145,16 @@ def _ensure_app_icon() -> Path:
 
 
 def _format_bytes(n: int) -> str:
-    """Human-readable memory size, e.g. 512 MB or 1.3 GB."""
+    """Human-readable size, e.g. 512 MB or 1.3 GB — or 340 KB for anything
+    under 1 MB, so a small temp-file cleanup doesn't misleadingly round
+    down to a flat "0 MB"."""
     gb = n / (1024 ** 3)
     if gb >= 1:
         return f"{gb:.1f} GB"
-    return f"{n / (1024 ** 2):.0f} MB"
+    mb = n / (1024 ** 2)
+    if mb >= 1:
+        return f"{mb:.0f} MB"
+    return f"{n / 1024:.0f} KB"
 
 
 class ScrollableDropdown(ctk.CTkFrame):
@@ -692,7 +697,10 @@ class App(ctk.CTk):
 
         def worker() -> None:
             state = optimizer.optimize_for_game(target)
-            self._boost_queue.put(("boost_done", target, state))
+            # Only worth clearing temp junk on an actual successful boost —
+            # skip it if the game process vanished before we could touch it.
+            temp_stats = optimizer.clear_temp_folders() if state is not None else None
+            self._boost_queue.put(("boost_done", target, state, temp_stats))
 
         threading.Thread(target=worker, daemon=True).start()
         self.after(QUEUE_POLL_MS, self._poll_boost_queue)
@@ -709,14 +717,14 @@ class App(ctk.CTk):
             if maintainer is not None:
                 maintainer.stop()
             optimizer.restore_defaults(state)
-            self._boost_queue.put(("unboost_done", None, None))
+            self._boost_queue.put(("unboost_done", None, None, None))
 
         threading.Thread(target=worker, daemon=True).start()
         self.after(QUEUE_POLL_MS, self._poll_boost_queue)
 
     def _poll_boost_queue(self) -> None:
         try:
-            kind, target, state = self._boost_queue.get_nowait()
+            kind, target, state, temp_stats = self._boost_queue.get_nowait()
         except queue.Empty:
             self.after(QUEUE_POLL_MS, self._poll_boost_queue)
             return
@@ -734,8 +742,16 @@ class App(ctk.CTk):
                 self.boost_state = state
                 self.boost_maintainer = optimizer.BoostMaintainer(state)
                 self.boost_maintainer.start()
+                temp_note = ""
+                if temp_stats and temp_stats["files_removed"] > 0:
+                    count = temp_stats["files_removed"]
+                    noun = "temp file" if count == 1 else "temp files"
+                    temp_note = f" Cleared {count} {noun} ({_format_bytes(temp_stats['bytes_freed'])})."
                 self.status_label.configure(
-                    text=f"Boosted '{target}' — {len(state.original_priorities)} background processes lowered.",
+                    text=(
+                        f"Boosted '{target}' — {len(state.original_priorities)} "
+                        f"background processes lowered.{temp_note}"
+                    ),
                     text_color=COLOR_SUCCESS,
                 )
                 self.boost_button.configure(
