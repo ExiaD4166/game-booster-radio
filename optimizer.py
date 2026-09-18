@@ -1,8 +1,10 @@
 """Local, single-PC game process optimizer.
 
-Raises the target game's priority and CPU affinity, lowers every other process
-running on THIS machine, and trims their idle RAM. Everything here is local —
-it never touches the network and has no effect on any other user.
+Raises the target game's priority and lowers the priority of safe-to-lower
+background apps on THIS machine (never Windows components, drivers, audio,
+input or anti-cheat software), and trims RAM for known-heavy apps. It is a
+one-shot operation with no background work afterward. Everything here is
+local — it never touches the network and has no effect on any other user.
 """
 
 from __future__ import annotations
@@ -73,6 +75,82 @@ HEAVY_BACKGROUND_NAMES = {
 }
 
 
+# Processes that must keep their normal priority no matter what. Lowering any
+# of these makes the game WORSE: the audio engine crackles, the desktop
+# compositor (dwm) delays every frame the game presents, graphics-driver
+# helpers stall, input tools add latency, capture/overlay tools drop frames,
+# and anti-cheat services can flag or kick the player. Windows' own processes
+# are also caught by the path rule in _is_protected() (anything running out of
+# the Windows folder), this list covers the third-party ones plus a few
+# Windows names whose path can't be read without admin rights.
+PROTECTED_NAMES = {
+    # Windows core / shell / input / audio
+    "system", "registry", "memory compression", "smss.exe", "csrss.exe",
+    "wininit.exe", "winlogon.exe", "services.exe", "lsass.exe", "lsaiso.exe",
+    "svchost.exe", "dwm.exe", "fontdrvhost.exe", "explorer.exe", "sihost.exe",
+    "taskhostw.exe", "ctfmon.exe", "audiodg.exe", "runtimebroker.exe",
+    "shellexperiencehost.exe", "startmenuexperiencehost.exe", "searchhost.exe",
+    "textinputhost.exe", "applicationframehost.exe", "conhost.exe",
+    "dllhost.exe", "wmiprvse.exe", "spoolsv.exe", "wudfhost.exe", "dashost.exe",
+    "lockapp.exe", "securityhealthservice.exe", "smartscreen.exe",
+    "msmpeng.exe", "nissrv.exe", "sgrmbroker.exe", "gamebar.exe",
+    "gamebarftserver.exe", "gamebarpresencewriter.exe",
+    # Graphics drivers and their control panels / overlays
+    "nvcontainer.exe", "nvdisplay.container.exe", "nvidia share.exe",
+    "nvidia overlay.exe", "nvidia web helper.exe", "nvspcaps64.exe",
+    "nvcplui.exe", "nvidia app.exe", "nvsphelper64.exe",
+    "radeonsoftware.exe", "amdow.exe", "amdrssrcext.exe", "atieclxx.exe",
+    "atiesrxx.exe", "amdfendrsr.exe", "cnext.exe", "amdrsserv.exe",
+    "igfxem.exe", "igfxhk.exe", "igfxtray.exe", "igfxcuiservice.exe",
+    # Audio drivers / mixers
+    "rtkauduservice64.exe", "rtkaudservice64.exe", "rtkngui64.exe",
+    "hpaudioswitch.exe", "nahimicservice.exe", "nahimicsvc64.exe",
+    "voicemeeter.exe", "voicemeeter8.exe", "voicemeeterpro.exe",
+    # Input devices / remapping (lowering these adds input lag)
+    "autohotkey.exe", "autohotkey32.exe", "autohotkey64.exe", "etdctrl.exe",
+    "lghub.exe", "lghub_agent.exe", "razer synapse 3.exe", "synapse3.exe",
+    "steelseriesgg.exe", "steelseriesengine3.exe", "icue.exe",
+    # Capture, overlays, hardware monitoring, CPU/GPU tuning
+    "obs64.exe", "obs32.exe", "streamlabs obs.exe", "rtss.exe",
+    "rtsshooksloader64.exe", "msiafterburner.exe", "hwinfo64.exe",
+    "hwinfo32.exe", "cpuz.exe", "coretemp.exe", "throttlestop.exe",
+    "ryzenmaster.exe", "gameoverlayui.exe", "eosoverlayrenderer64.exe",
+    # Anti-cheat
+    "easyanticheat.exe", "easyanticheat_eos.exe", "beservice.exe",
+    "bedaisy.exe", "vgc.exe", "vgtray.exe", "faceitclient.exe",
+    # Game launcher runtimes a running game commonly depends on
+    "steam.exe", "steamservice.exe", "upc.exe", "eadesktop.exe",
+    "eabackgroundservice.exe", "battle.net.exe", "rockstarservice.exe",
+}
+
+
+def _is_protected(proc: psutil.Process, game_dir: str | None, keep_pids: set[int]) -> bool:
+    """True if this process must be left completely alone.
+
+    Protected: our own/game-related processes (keep_pids: the game, the
+    launcher that started it, everything it spawned), anything in
+    PROTECTED_NAMES, anything running from the Windows folder (svchost, dwm,
+    audiodg, explorer... every built-in component), and anything installed
+    in the game's own folder (its anti-cheat, crash handler, helper exes).
+    """
+    if proc.pid in keep_pids:
+        return True
+    try:
+        name = proc.name()
+        if name.lower() in PROTECTED_NAMES:
+            return True
+        exe = proc.exe()
+    except (psutil.NoSuchProcess, psutil.AccessDenied):
+        return True  # can't inspect it, so we couldn't safely judge or change it
+    exe_lower = exe.lower()
+    windir = os.environ.get("SystemRoot", r"C:\Windows").lower()
+    if exe_lower.startswith(windir + os.sep):
+        return True
+    if game_dir and exe_lower.startswith(game_dir + os.sep):
+        return True
+    return False
+
+
 def _target_priority_for(name: str) -> int:
     """BELOW_NORMAL by default; IDLE for known-heavy background apps."""
     if name.lower() in HEAVY_BACKGROUND_NAMES:
@@ -85,7 +163,6 @@ class BoostState:
     """What optimize_for_game() changed, so restore_defaults() can undo it."""
 
     game_pid: int
-    dedicated_cores: list[int] = field(default_factory=list)
     original_priorities: dict[int, int] = field(default_factory=dict)
 
 
@@ -109,7 +186,6 @@ def _save_state_file(state: BoostState) -> None:
             json.dumps(
                 {
                     "game_pid": state.game_pid,
-                    "dedicated_cores": state.dedicated_cores,
                     "original_priorities": state.original_priorities,
                 }
             )
@@ -195,25 +271,31 @@ def trim_working_set(pid: int) -> bool:
 
 
 def _deprioritize(proc: psutil.Process, state: BoostState) -> None:
-    """Record a process's current priority, lower it, and trim its RAM.
+    """Record a process's current priority and lower it.
 
     Known-heavy apps (browsers, chat clients, cloud-sync updaters) drop to
-    IDLE_PRIORITY_CLASS; everything else gets the standard BELOW_NORMAL.
+    IDLE_PRIORITY_CLASS and have their RAM trimmed; everything else gets the
+    standard BELOW_NORMAL and is otherwise left alone. RAM is deliberately NOT
+    trimmed for every process: a trimmed process has to page its memory back
+    in the moment it next runs, which is itself a source of hitches.
 
     Raises psutil.NoSuchProcess/AccessDenied for the caller to catch — a process
     can exit mid-scan, or belong to another user, at any time.
     """
     pid = proc.pid
+    name = proc.name()
     state.original_priorities[pid] = proc.nice()
-    proc.nice(_target_priority_for(proc.name()))
-    trim_working_set(pid)
+    proc.nice(_target_priority_for(name))
+    if name.lower() in HEAVY_BACKGROUND_NAMES:
+        trim_working_set(pid)
 
 
-def optimize_for_game(exe_name: str, core_count: int = 2) -> BoostState | None:
-    """Boost `exe_name` and deprioritize everything else on this PC.
+def optimize_for_game(exe_name: str) -> BoostState | None:
+    """Boost `exe_name` and lower the priority of safe-to-lower background apps.
 
-    Returns a BoostState to pass to restore_defaults() later, or None if the
-    game isn't currently running.
+    One-shot: everything happens right now and nothing keeps running
+    afterward. Returns a BoostState to pass to restore_defaults() later, or
+    None if the game isn't currently running.
     """
     global _active_state
     if _active_state is not None:
@@ -228,35 +310,39 @@ def optimize_for_game(exe_name: str, core_count: int = 2) -> BoostState | None:
         logger.warning("Game process '%s' not found running.", exe_name)
         return None
 
-    total_cores = psutil.cpu_count(logical=True) or 1
-    core_count = min(core_count, total_cores)
-    # Core 0 fields a disproportionate share of Windows' own interrupts, so we
-    # dedicate the highest-numbered cores to the game rather than the first ones.
-    game_cores = list(range(total_cores - core_count, total_cores))
+    state = BoostState(game_pid=game_proc.pid)
 
-    state = BoostState(game_pid=game_proc.pid, dedicated_cores=game_cores)
-
+    # The game is deliberately left free to run on EVERY core. An earlier
+    # version pinned it to two logical cores (one physical core with
+    # hyperthreading), which measured ~4x slower on a multi-threaded workload
+    # and is a direct cause of stutter in any modern game.
     try:
         game_proc.nice(psutil.HIGH_PRIORITY_CLASS)
-        game_proc.cpu_affinity(game_cores)
     except (psutil.NoSuchProcess, psutil.AccessDenied) as exc:
         logger.warning("Could not boost '%s': %s", exe_name, exc)
         return None
 
-    own_pid = psutil.Process().pid
-    for proc in psutil.process_iter(["pid", "name"]):
-        pid = proc.info["pid"]
-        if pid in RESERVED_PIDS or pid == game_proc.pid or pid == own_pid:
-            continue
+    # Never touch the game's whole family: the launcher that started it and
+    # everything it spawned (anti-cheat, crash handler, helper processes).
+    keep_pids = {psutil.Process().pid, game_proc.pid} | RESERVED_PIDS
+    try:
+        keep_pids |= {p.pid for p in game_proc.parents()}
+        keep_pids |= {p.pid for p in game_proc.children(recursive=True)}
+        game_dir = str(Path(game_proc.exe()).parent).lower()
+    except (psutil.NoSuchProcess, psutil.AccessDenied):
+        game_dir = None
 
+    for proc in psutil.process_iter(["pid"]):
         try:
+            if _is_protected(proc, game_dir, keep_pids):
+                continue
             _deprioritize(proc, state)
         except (psutil.NoSuchProcess, psutil.AccessDenied):
             continue
 
     logger.info(
-        "Boosted '%s' (pid %s) on cores %s; lowered %d background processes.",
-        exe_name, game_proc.pid, game_cores, len(state.original_priorities),
+        "Boosted '%s' (pid %s); lowered %d background processes.",
+        exe_name, game_proc.pid, len(state.original_priorities),
     )
     _active_state = state
     _save_state_file(state)
@@ -475,60 +561,6 @@ class StatsMonitor:
             self._stop_event.wait(self.interval_seconds)
 
 
-class BoostMaintainer:
-    """While a boost is active, periodically lowers newly-spawned processes too.
-
-    optimize_for_game() only sees processes that exist at the moment it's called.
-    A browser opening a new tab five minutes later would spawn at normal
-    priority otherwise — this catches those on a slower, cheaper-average cadence.
-    """
-
-    def __init__(self, state: BoostState, interval_seconds: float = 5.0):
-        self.state = state
-        self.interval_seconds = interval_seconds
-        self._stop_event = threading.Event()
-        self._thread: threading.Thread | None = None
-
-    def start(self) -> None:
-        if self._thread is not None:
-            return
-        self._stop_event.clear()
-        self._thread = threading.Thread(target=self._run, daemon=True)
-        self._thread.start()
-
-    def stop(self) -> None:
-        self._stop_event.set()
-        if self._thread is not None:
-            self._thread.join(timeout=2)
-            self._thread = None
-
-    def _run(self) -> None:
-        while not self._stop_event.is_set():
-            self._sweep_new_processes()
-            self._stop_event.wait(self.interval_seconds)
-
-    def _sweep_new_processes(self) -> None:
-        own_pid = psutil.Process().pid
-        caught_any = False
-        for proc in psutil.process_iter(["pid", "name"]):
-            pid = proc.info["pid"]
-            if (
-                pid in RESERVED_PIDS
-                or pid == self.state.game_pid
-                or pid == own_pid
-                or pid in self.state.original_priorities
-            ):
-                continue
-            try:
-                _deprioritize(proc, self.state)
-                caught_any = True
-            except (psutil.NoSuchProcess, psutil.AccessDenied):
-                continue
-
-        if caught_any:
-            _save_state_file(self.state)
-
-
 if __name__ == "__main__":
     logging.basicConfig(level=logging.INFO, format="%(levelname)s: %(message)s")
 
@@ -545,8 +577,7 @@ if __name__ == "__main__":
         print(f"Could not find or boost '{target}'. Is it running?")
         raise SystemExit(1)
 
-    print(f"Boosted on cores {boost_state.dedicated_cores}. "
-          f"{len(boost_state.original_priorities)} background processes lowered.")
+    print(f"Boosted. {len(boost_state.original_priorities)} background processes lowered.")
     input("Press Enter to restore everything to normal...\n")
     restore_defaults(boost_state)
     print("Restored.")

@@ -295,7 +295,6 @@ class App(ctk.CTk):
 
         self.stats_monitor = optimizer.StatsMonitor(interval_seconds=1.0)
         self.boost_state: optimizer.BoostState | None = None
-        self.boost_maintainer: optimizer.BoostMaintainer | None = None
         self._boost_queue: queue.Queue = queue.Queue()
         self._process_name_by_display: dict[str, str] = {}
 
@@ -723,11 +722,8 @@ class App(ctk.CTk):
         )
 
         state = self.boost_state
-        maintainer = self.boost_maintainer
 
         def worker() -> None:
-            if maintainer is not None:
-                maintainer.stop()
             optimizer.restore_defaults(state)
             self._boost_queue.put(("unboost_done", None, None, None))
 
@@ -752,8 +748,6 @@ class App(ctk.CTk):
                 )
             else:
                 self.boost_state = state
-                self.boost_maintainer = optimizer.BoostMaintainer(state)
-                self.boost_maintainer.start()
                 temp_note = ""
                 if temp_stats and temp_stats["files_removed"] > 0:
                     count = temp_stats["files_removed"]
@@ -772,7 +766,6 @@ class App(ctk.CTk):
                 )
         elif kind == "unboost_done":
             self.boost_state = None
-            self.boost_maintainer = None
             self.status_label.configure(text="Idle — no game boosted.", text_color=COLOR_TEXT_MUTED)
             self.boost_button.configure(
                 state="normal", text="⚡ BOOST GAME",
@@ -1154,8 +1147,6 @@ class App(ctk.CTk):
 
     def _on_close(self) -> None:
         self.stats_monitor.stop()
-        if self.boost_maintainer is not None:
-            self.boost_maintainer.stop()
         if self.boost_state is not None:
             optimizer.restore_defaults(self.boost_state)
         if self.sync_client is not None:

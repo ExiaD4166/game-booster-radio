@@ -14,14 +14,16 @@ play — without touching video decoding or adding noticeable CPU/RAM overhead.
 
 **Game Optimizer**
 - Pick any running process and boost it: raises its priority to `HIGH_PRIORITY_CLASS`
-  and dedicates specific CPU cores to it.
-- Every other background process on your PC gets lowered to `BELOW_NORMAL` priority
-  and has its idle RAM trimmed, freeing up resources for your game.
-- Keeps watching in the background and automatically catches new processes that
-  launch *after* you hit Boost (a browser opening a new tab, for example).
+  and leaves it free to use every CPU core.
+- Lowers safe-to-lower background apps (browsers and chat clients drop to `Low`, other
+  user apps to `Below Normal`) and trims RAM for the known-heavy ones.
+- Never touches what a game depends on: Windows components, graphics/audio drivers,
+  input tools, capture/overlay software, anti-cheat, or the game's own launcher and helpers.
+- One-shot and lightweight: everything happens once when you click Boost, with no
+  background scanning afterward.
+- Clears temp files older than 24 hours.
 - Crash-safe: if the app itself ever crashes mid-boost, it detects the leftover state
-  on the next launch and automatically restores everything — you're never left with
-  background apps permanently stuck at low priority.
+  on the next launch and automatically restores everything.
 - One click to restore everything back to normal.
 
 **Sync Radio**
@@ -35,7 +37,7 @@ play — without touching video decoding or adding noticeable CPU/RAM overhead.
   locally, with zero effect on anyone else.
 - A local Radio ON/OFF toggle and volume slider always work for everyone, regardless
   of role — muting your own speakers never affects other listeners.
-- Client positions automatically self-correct if they drift more than 1.5 seconds
+- Client positions automatically self-correct if they drift more than 3 seconds
   from the shared server's position, so everyone stays close to in-sync even over a
   real internet connection.
 - Audio-only streaming (`yt-dlp` + VLC) — no video is ever downloaded or rendered,
