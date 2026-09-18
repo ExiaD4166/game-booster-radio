@@ -34,6 +34,49 @@ PROCESS_SET_QUOTA = 0x0100
 # Fixed, well-known PIDs Windows reserves for itself — never touch these.
 RESERVED_PIDS = {0, 4}
 
+# Common heavy background apps and their updaters/helpers — these get pushed
+# all the way down to IDLE_PRIORITY_CLASS (what Task Manager labels "Low")
+# instead of the default BELOW_NORMAL, since they're frequent, real
+# contributors to stutter if left only moderately deprioritized. Matched by
+# exact executable name (case-insensitive) — edit this set to add more.
+HEAVY_BACKGROUND_NAMES = {
+    # Browsers
+    "chrome.exe",
+    "msedge.exe",
+    "msedgewebview2.exe",
+    "firefox.exe",
+    "brave.exe",
+    "opera.exe",
+    "opera_gx.exe",
+    "vivaldi.exe",
+    # Chat / communication
+    "discord.exe",
+    "discordptt.exe",
+    "slack.exe",
+    "teams.exe",
+    "ms-teams.exe",
+    "skype.exe",
+    "zoom.exe",
+    # Cloud sync clients and app updaters
+    "onedrive.exe",
+    "dropbox.exe",
+    "googledrivesync.exe",
+    "googleupdate.exe",
+    "microsoftedgeupdate.exe",
+    "adobeupdateservice.exe",
+    "creativecloud.exe",
+    "steamwebhelper.exe",
+    "epicgameslauncher.exe",
+    "epicwebhelper.exe",
+}
+
+
+def _target_priority_for(name: str) -> int:
+    """BELOW_NORMAL by default; IDLE for known-heavy background apps."""
+    if name.lower() in HEAVY_BACKGROUND_NAMES:
+        return psutil.IDLE_PRIORITY_CLASS
+    return psutil.BELOW_NORMAL_PRIORITY_CLASS
+
 
 @dataclass
 class BoostState:
@@ -108,12 +151,17 @@ def recover_from_leftover_state(leftover: dict) -> int:
         pass
 
     restored = 0
+    known_pids = {leftover.get("game_pid")}
     for pid_str, original_priority in leftover.get("original_priorities", {}).items():
         try:
-            psutil.Process(int(pid_str)).nice(original_priority)
+            pid = int(pid_str)
+            known_pids.add(pid)
+            psutil.Process(pid).nice(original_priority)
             restored += 1
         except (psutil.NoSuchProcess, psutil.AccessDenied, ValueError):
             continue
+
+    _reset_unrecorded_stragglers(known_pids)
 
     _clear_state_file()
     return restored
@@ -147,12 +195,15 @@ def trim_working_set(pid: int) -> bool:
 def _deprioritize(proc: psutil.Process, state: BoostState) -> None:
     """Record a process's current priority, lower it, and trim its RAM.
 
+    Known-heavy apps (browsers, chat clients, cloud-sync updaters) drop to
+    IDLE_PRIORITY_CLASS; everything else gets the standard BELOW_NORMAL.
+
     Raises psutil.NoSuchProcess/AccessDenied for the caller to catch — a process
     can exit mid-scan, or belong to another user, at any time.
     """
     pid = proc.pid
     state.original_priorities[pid] = proc.nice()
-    proc.nice(psutil.BELOW_NORMAL_PRIORITY_CLASS)
+    proc.nice(_target_priority_for(proc.name()))
     trim_working_set(pid)
 
 
@@ -210,6 +261,28 @@ def optimize_for_game(exe_name: str, core_count: int = 2) -> BoostState | None:
     return state
 
 
+def _reset_unrecorded_stragglers(known_pids: set[int]) -> None:
+    """Catch processes lowered by inheritance, not by us directly.
+
+    A process that spawns *during* a boost inherits its parent's already-
+    lowered priority at creation time (Windows' own default behavior for
+    child processes) — a new browser tab opened while boosted, for example.
+    It never appears in original_priorities, since it didn't exist when we
+    scanned, so the loop above has nothing to restore it with. Resetting any
+    still-lowered process we have no record of to NORMAL is a safe default:
+    that's what a freshly created process would normally start at anyway.
+    """
+    for proc in psutil.process_iter(["pid"]):
+        pid = proc.info["pid"]
+        if pid in known_pids or pid in RESERVED_PIDS:
+            continue
+        try:
+            if proc.nice() in (psutil.BELOW_NORMAL_PRIORITY_CLASS, psutil.IDLE_PRIORITY_CLASS):
+                proc.nice(psutil.NORMAL_PRIORITY_CLASS)
+        except (psutil.NoSuchProcess, psutil.AccessDenied):
+            continue
+
+
 def restore_defaults(state: BoostState) -> None:
     """Undo optimize_for_game(): restore the game and every lowered process."""
     global _active_state
@@ -225,6 +298,8 @@ def restore_defaults(state: BoostState) -> None:
             psutil.Process(pid).nice(original_priority)
         except (psutil.NoSuchProcess, psutil.AccessDenied):
             continue
+
+    _reset_unrecorded_stragglers(set(state.original_priorities) | {state.game_pid})
 
     if _active_state is state:
         _active_state = None
