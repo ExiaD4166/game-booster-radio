@@ -402,6 +402,13 @@ class App(ctk.CTk):
         )
         self.connect_button.grid(row=0, column=1, padx=(8, 0))
 
+        self.admin_password_entry = ctk.CTkEntry(
+            connect_row, placeholder_text="Admin password (optional)", show="*",
+            height=32, corner_radius=8, font=ctk.CTkFont(family=FONT, size=12),
+            fg_color=COLOR_SURFACE, border_color=COLOR_BORDER, text_color=COLOR_TEXT,
+        )
+        self.admin_password_entry.grid(row=1, column=0, sticky="ew", pady=(6, 0))
+
         self.sync_badge = ctk.CTkFrame(content, corner_radius=12, fg_color=COLOR_BADGE_BG_NEUTRAL)
         self.sync_badge.grid(row=3, column=0, sticky="w", padx=20, pady=(12, 2))
         self.sync_badge_label = ctk.CTkLabel(
@@ -618,10 +625,13 @@ class App(ctk.CTk):
         if self.sync_client is not None:
             self._disconnect()
             return
-        self.sync_client = sync_client.SyncClient(self._server_uri())
+        password = self.admin_password_entry.get().strip()
+        hello = {"name": "Guest", "password": password} if password else {"name": "Guest"}
+        self.sync_client = sync_client.SyncClient(self._server_uri(), hello=hello)
         self.sync_client.start()
         self.connect_button.configure(text="Disconnect")
         self.server_entry.configure(state="disabled")
+        self.admin_password_entry.configure(state="disabled")
 
     def _disconnect(self) -> None:
         if self.sync_client is not None:
@@ -629,6 +639,7 @@ class App(ctk.CTk):
             self.sync_client = None
         self.connect_button.configure(text="Connect")
         self.server_entry.configure(state="normal")
+        self.admin_password_entry.configure(state="normal")
         self._set_sync_badge("● DISCONNECTED", COLOR_TEXT_MUTED, COLOR_BADGE_BG_NEUTRAL)
         self._update_users_list([])
         self.track_action_button.configure(state="normal")

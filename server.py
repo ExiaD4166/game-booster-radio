@@ -28,6 +28,13 @@ HOST = os.environ.get("HOST", "0.0.0.0")
 PORT = int(os.environ.get("PORT", 8765))
 BROADCAST_INTERVAL_SECONDS = 3.0
 
+# Optional: a client sending this exact password in its "hello" message
+# claims regular admin immediately, regardless of connection order — same
+# powers as any other admin, just guaranteed instead of depending on who
+# happened to connect first. Unset by default (None), which disables this
+# entirely; set the ADMIN_PASSWORD environment variable to turn it on.
+ADMIN_PASSWORD = os.environ.get("ADMIN_PASSWORD")
+
 ADMIN_ONLY_MESSAGE_TYPES = {"set_playlist", "play", "pause", "seek", "skip", "stop_sync", "promote"}
 
 _next_client_id = count(1)
@@ -122,6 +129,10 @@ async def _handle_message(client: Client, raw: str) -> None:
 
     if msg_type == "hello":
         client.name = str(msg.get("name", "Guest"))[:40]
+        password = msg.get("password")
+        if ADMIN_PASSWORD and password == ADMIN_PASSWORD and client.role != "admin":
+            client.role = "admin"
+            logger.info("Client %s claimed admin via password.", client.id)
         await _broadcast_state()
         return
 

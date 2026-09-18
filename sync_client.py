@@ -25,8 +25,9 @@ RECONNECT_DELAY_SECONDS = 3.0
 class SyncClient:
     """Connects to server.py, auto-reconnecting if the connection drops."""
 
-    def __init__(self, uri: str) -> None:
+    def __init__(self, uri: str, hello: dict | None = None) -> None:
         self.uri = uri
+        self._hello = hello
         self._loop: asyncio.AbstractEventLoop | None = None
         self._thread: threading.Thread | None = None
         self._ws: websockets.ClientConnection | None = None
@@ -98,6 +99,12 @@ class SyncClient:
                     with self._lock:
                         self._connected = True
                     logger.info("Connected to %s", self.uri)
+                    if self._hello:
+                        # Sent on every successful connect, including
+                        # reconnects — a dropped connection means starting
+                        # over as a new client server-side, so anything
+                        # (like an admin password) needs resending too.
+                        await ws.send(json.dumps({"type": "hello", **self._hello}))
                     async for raw in ws:
                         self._handle_message(raw)
             except Exception as exc:
