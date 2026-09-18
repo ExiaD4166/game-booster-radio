@@ -1,7 +1,7 @@
 """Desktop GUI shell.
 
 Left pane: game optimizer dashboard, wired to optimizer.py.
-Right pane: placeholder for the sync radio controls, built in a later phase.
+Right pane: sync radio controls, wired to sync_client.py and radio_player.py.
 """
 
 from __future__ import annotations
@@ -9,6 +9,7 @@ from __future__ import annotations
 import logging
 import queue
 import threading
+from pathlib import Path
 
 import customtkinter as ctk
 import psutil
@@ -29,6 +30,9 @@ SYNC_POLL_MS = 500
 DRIFT_THRESHOLD_SECONDS = 1.5
 DEFAULT_SERVER_URI = "ws://localhost:8765"
 
+ASSETS_DIR = Path(__file__).parent / "assets"
+ICON_PATH = ASSETS_DIR / "app_icon.ico"
+
 # Visual identity: a Discord-style dark palette instead of CTk's flat default.
 FONT = "Segoe UI"
 COLOR_BG = "#1E1F22"
@@ -46,6 +50,13 @@ COLOR_BUSY = "#4E5058"
 COLOR_SUCCESS = "#23A559"
 COLOR_WARNING = "#F0B232"
 COLOR_ACCENT_LIGHT = "#9AA0F5"
+
+# Dark, muted tints for badge backgrounds — each pairs with its matching
+# status color above (e.g. COLOR_BADGE_BG_SUCCESS behind COLOR_SUCCESS text).
+COLOR_BADGE_BG_NEUTRAL = COLOR_SURFACE
+COLOR_BADGE_BG_SUCCESS = "#173A29"
+COLOR_BADGE_BG_ACCENT = "#242759"
+COLOR_BADGE_BG_WARNING = "#3A2E12"
 
 
 def _load_bar_color(percent: float) -> str:
@@ -87,6 +98,41 @@ def _make_gamepad_icon(size: int, color: str) -> Image.Image:
     return img.resize((size, size), Image.LANCZOS)
 
 
+def _make_app_icon(size: int) -> Image.Image:
+    """A solid rounded-square tile with the gamepad mark on top.
+
+    Standalone app icons (unlike the in-window heading icon) conventionally
+    sit on a solid colored tile — Discord, Spotify, etc. all do this — so the
+    icon stays legible against any taskbar background.
+    """
+    scale = 4
+    s = size * scale
+    background = Image.new("RGBA", (s, s), (0, 0, 0, 0))
+    ImageDraw.Draw(background).rounded_rectangle([0, 0, s, s], radius=s * 0.22, fill=COLOR_ACCENT)
+    background = background.resize((size, size), Image.LANCZOS)
+
+    mark = _make_gamepad_icon(size // 2, COLOR_TEXT)  # already crisp at its own final size
+    offset = ((size - mark.width) // 2, (size - mark.height) // 2)
+    background.alpha_composite(mark, offset)
+    return background
+
+
+def _ensure_app_icon() -> Path:
+    """Generate the .ico file on first run if it doesn't exist yet, and return its path.
+
+    CustomTkinter resets a titlebar icon set via iconphoto() ~200ms after
+    startup (it schedules its own default icon unless iconbitmap() was
+    called), so a real .ico file + iconbitmap() is the reliable approach.
+    This file also becomes the asset Phase 10's .exe packaging will need.
+    """
+    if not ICON_PATH.exists():
+        ASSETS_DIR.mkdir(parents=True, exist_ok=True)
+        _make_app_icon(256).save(
+            ICON_PATH, format="ICO", sizes=[(16, 16), (32, 32), (48, 48), (64, 64), (128, 128), (256, 256)]
+        )
+    return ICON_PATH
+
+
 class App(ctk.CTk):
     def __init__(self) -> None:
         super().__init__()
@@ -94,6 +140,8 @@ class App(ctk.CTk):
         self.geometry("980x620")
         self.minsize(840, 520)
         self.configure(fg_color=COLOR_BG)
+
+        self.iconbitmap(str(_ensure_app_icon()))
 
         self.grid_columnconfigure(0, weight=1)
         self.grid_columnconfigure(1, weight=1)
@@ -260,6 +308,10 @@ class App(ctk.CTk):
     def _divider(parent: ctk.CTkFrame) -> ctk.CTkFrame:
         return ctk.CTkFrame(parent, height=1, fg_color=COLOR_BORDER)
 
+    def _set_sync_badge(self, text: str, text_color: str, bg_color: str) -> None:
+        self.sync_badge_label.configure(text=text, text_color=text_color)
+        self.sync_badge.configure(fg_color=bg_color)
+
     def _build_right_pane(self) -> None:
         # A plain frame, matching the left pane's proven layout pattern —
         # CTkScrollableFrame's inner content did not stretch to fill the
@@ -305,11 +357,13 @@ class App(ctk.CTk):
         )
         self.connect_button.grid(row=0, column=1, padx=(8, 0))
 
+        self.sync_badge = ctk.CTkFrame(content, corner_radius=12, fg_color=COLOR_BADGE_BG_NEUTRAL)
+        self.sync_badge.grid(row=3, column=0, sticky="w", padx=20, pady=(12, 2))
         self.sync_badge_label = ctk.CTkLabel(
-            content, text="● DISCONNECTED",
-            font=ctk.CTkFont(family=FONT, size=13, weight="bold"), text_color=COLOR_TEXT_MUTED,
+            self.sync_badge, text="● DISCONNECTED",
+            font=ctk.CTkFont(family=FONT, size=12, weight="bold"), text_color=COLOR_TEXT_MUTED,
         )
-        self.sync_badge_label.grid(row=3, column=0, sticky="w", padx=20, pady=(12, 2))
+        self.sync_badge_label.grid(row=0, column=0, padx=12, pady=4)
 
         self.track_label = ctk.CTkLabel(
             content, text="No track loaded.", font=ctk.CTkFont(family=FONT, size=13),
@@ -530,7 +584,7 @@ class App(ctk.CTk):
             self.sync_client = None
         self.connect_button.configure(text="Connect")
         self.server_entry.configure(state="normal")
-        self.sync_badge_label.configure(text="● DISCONNECTED", text_color=COLOR_TEXT_MUTED)
+        self._set_sync_badge("● DISCONNECTED", COLOR_TEXT_MUTED, COLOR_BADGE_BG_NEUTRAL)
         self._update_users_list([])
         self.track_action_button.configure(state="normal")
         self.play_pause_button.configure(state="disabled")
@@ -548,7 +602,7 @@ class App(ctk.CTk):
             if connected and state is not None:
                 self._apply_sync_state(state)
             elif not connected:
-                self.sync_badge_label.configure(text="● RECONNECTING...", text_color=COLOR_WARNING)
+                self._set_sync_badge("● RECONNECTING...", COLOR_WARNING, COLOR_BADGE_BG_WARNING)
         self.after(SYNC_POLL_MS, self._poll_sync_state)
 
     def _apply_sync_state(self, state: dict) -> None:
@@ -561,7 +615,7 @@ class App(ctk.CTk):
         self._update_users_list(state.get("users", []))
 
         if sync_active:
-            self.sync_badge_label.configure(text="🔒 SYNCED TO ADMIN STREAM", text_color=COLOR_SUCCESS)
+            self._set_sync_badge("🔒 SYNCED TO ADMIN STREAM", COLOR_SUCCESS, COLOR_BADGE_BG_SUCCESS)
 
             if track_url and (not self._is_synced_playback or track_url != self._loaded_track_url):
                 self._is_synced_playback = True
@@ -590,7 +644,7 @@ class App(ctk.CTk):
                 self._loaded_track_url = None
                 self.track_label.configure(text="No track loaded.")
 
-            self.sync_badge_label.configure(text="🎧 LOCAL PLAYER MODE", text_color=COLOR_ACCENT_LIGHT)
+            self._set_sync_badge("🎧 LOCAL PLAYER MODE", COLOR_ACCENT_LIGHT, COLOR_BADGE_BG_ACCENT)
             self.track_entry.configure(state="normal", placeholder_text="Paste a YouTube link...")
             self.track_action_button.configure(
                 text="Sync for Everyone" if is_admin else "Play Locally", state="normal"
