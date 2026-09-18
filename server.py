@@ -87,6 +87,7 @@ def _state_payload(recipient: Client) -> str:
             "position": round(state.current_position(), 2),
             "is_playing": state.is_playing,
             "queue_length": len(state.queue),
+            "queue_index": state.current_index % len(state.queue) if state.queue else 0,
             "your_id": recipient.id,
             "your_role": recipient.role,
             "users": [

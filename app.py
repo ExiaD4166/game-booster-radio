@@ -310,6 +310,8 @@ class App(ctk.CTk):
         self._auto_skip_track_url: str | None = None
         self._local_queue: list[str] = []
         self._local_queue_index: int = 0
+        self._synced_queue_position: tuple[int, int] | None = None
+        self._loading_track = False
 
         self._build_left_pane()
         self._build_right_pane()
@@ -495,6 +497,16 @@ class App(ctk.CTk):
         if updates:
             button.configure(**updates)
 
+    def _queue_position_text(self) -> str:
+        """' (2/23)' when playing from a multi-track queue, else empty."""
+        if self._is_synced_playback:
+            pos = self._synced_queue_position
+            if pos and pos[1] > 1:
+                return f" ({pos[0] + 1}/{pos[1]})"
+        elif len(self._local_queue) > 1:
+            return f" ({self._local_queue_index + 1}/{len(self._local_queue)})"
+        return ""
+
     def _set_local_skip_button_state(self) -> None:
         """Skip only makes sense locally once there's more than one track to
         move to — a lone personal video has nowhere to skip forward to."""
@@ -612,7 +624,7 @@ class App(ctk.CTk):
         )
         self.play_pause_button.grid(row=0, column=0, sticky="ew", padx=(0, 4))
         self.skip_button = ctk.CTkButton(
-            playback_row, text="⏭ Skip", height=36, corner_radius=8,
+            playback_row, text="⏭ Next", height=36, corner_radius=8,
             font=ctk.CTkFont(family=FONT, size=13),
             fg_color="transparent", hover_color=COLOR_SURFACE,
             border_width=1, border_color=COLOR_BORDER, text_color=COLOR_TEXT,
@@ -836,6 +848,9 @@ class App(ctk.CTk):
         server_position = state.get("position", 0.0)
 
         self._update_users_list(state.get("users", []))
+        self._synced_queue_position = (
+            (state.get("queue_index", 0), state.get("queue_length", 0)) if sync_active else None
+        )
 
         if sync_active:
             self._set_sync_badge("🔒 SYNCED TO ADMIN STREAM", COLOR_SUCCESS, COLOR_BADGE_BG_SUCCESS)
@@ -854,11 +869,11 @@ class App(ctk.CTk):
                 # doesn't try to restart the just-ended track from the top
                 # instead of letting it advance to the next one.
                 ended = self.radio_player.is_ended()
-                if is_admin and ended and state.get("queue_length", 0) > 1:
+                if is_admin and ended and not self._loading_track and state.get("queue_length", 0) > 1:
                     if self._auto_skip_track_url != self._loaded_track_url:
                         self._auto_skip_track_url = self._loaded_track_url
                         self.sync_client.send({"type": "skip"})
-                else:
+                elif not (ended and self._loading_track):
                     if server_is_playing and not self.radio_player.is_playing() and not ended:
                         self.radio_player.play()
                     elif not server_is_playing and self.radio_player.is_playing():
@@ -903,6 +918,9 @@ class App(ctk.CTk):
 
     def _start_load_track(self, url: str, seek_to: float = 0.0, autoplay: bool = True) -> None:
         self.track_label.configure(text=f"Loading '{url}'...")
+        # The player still reports the PREVIOUS track as Ended until the new
+        # one finishes loading; auto-advance must not read that as another end.
+        self._loading_track = True
 
         def worker() -> None:
             try:
@@ -944,8 +962,11 @@ class App(ctk.CTk):
             self._start_load_track(urls[0], seek_to=0.0, autoplay=True)
             return
 
+        if kind in ("load_done", "load_failed"):
+            self._loading_track = False
+
         if kind == "load_done":
-            self.track_label.configure(text=f"Now playing: {info['title']}")
+            self.track_label.configure(text=f"Now playing{self._queue_position_text()}: {info['title']}")
             if seek_to:
                 self.radio_player.seek(seek_to)
             if autoplay:
