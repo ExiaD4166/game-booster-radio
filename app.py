@@ -7,14 +7,16 @@ Right pane: sync radio controls, wired to sync_client.py and radio_player.py.
 from __future__ import annotations
 
 import logging
+import math
 import queue
 import threading
 import time
+import tkinter as tk
 from pathlib import Path
 
 import customtkinter as ctk
 import psutil
-from PIL import Image, ImageDraw
+from PIL import Image, ImageDraw, ImageFilter
 
 import optimizer
 import radio_player
@@ -67,6 +69,8 @@ COLOR_BUSY = "#4E5058"
 COLOR_SUCCESS = "#23A559"
 COLOR_WARNING = "#F0B232"
 COLOR_ACCENT_LIGHT = "#9AA0F5"
+COLOR_CARD_BORDER = "#383A40"
+SHADOW_MARGIN = 12
 
 # Dark, muted tints for badge backgrounds — each pairs with its matching
 # status color above (e.g. COLOR_BADGE_BG_SUCCESS behind COLOR_SUCCESS text).
@@ -179,6 +183,205 @@ def _server_position_now(state: dict) -> float:
     return position
 
 
+def _hex_to_rgb(color: str) -> tuple[int, int, int]:
+    color = color.lstrip("#")
+    return int(color[0:2], 16), int(color[2:4], 16), int(color[4:6], 16)
+
+
+def _lerp_color(a: str, b: str, t: float) -> str:
+    """Blend two #rrggbb colors; t=0 gives a, t=1 gives b."""
+    (r1, g1, b1), (r2, g2, b2) = _hex_to_rgb(a), _hex_to_rgb(b)
+    mix = lambda x, y: max(0, min(255, round(x + (y - x) * t)))
+    return f"#{mix(r1, r2):02x}{mix(g1, g2):02x}{mix(b1, b2):02x}"
+
+
+def _ease_out(t: float) -> float:
+    return 1 - (1 - t) ** 3
+
+
+def _make_shadow_image(width: int, height: int, margin: float, radius: float,
+                       blur: float, dy: float, opacity: float, bg: str,
+                       glow: str = COLOR_ACCENT, glow_opacity: float = 0.7) -> Image.Image:
+    """A soft glow plus drop shadow of a rounded rectangle, already blended onto `bg`.
+
+    Tk has no real transparency, so a shadow can't be layered over other
+    widgets; instead the (solid-colored) background behind a card is drawn as
+    an image that already contains it. On a background this dark a pure black
+    shadow barely shows, so a faint accent-colored glow (lighter than the
+    background) sits under a tighter dark shadow - together they read as depth.
+    The blur is done on a quarter-size mask and scaled up - the result is
+    blurry anyway, and this keeps it fast even for a large window.
+    """
+    k = 4
+    mw, mh = max(width // k, 1), max(height // k, 1)
+
+    def layer(offset_y: float, sigma: float, alpha: float, inset: float = 0) -> Image.Image:
+        mask = Image.new("L", (mw, mh), 0)
+        ImageDraw.Draw(mask).rounded_rectangle(
+            [(margin + inset) / k, (margin + offset_y) / k,
+             (width - margin - inset) / k, (height - margin + offset_y) / k],
+            radius=radius / k, fill=int(255 * alpha),
+        )
+        return mask.filter(ImageFilter.GaussianBlur(sigma / k)).resize((width, height), Image.BILINEAR)
+
+    image = Image.new("RGB", (width, height), bg)
+    image.paste(Image.new("RGB", (width, height), _hex_to_rgb(glow)), (0, 0), layer(0, blur, glow_opacity))
+    # The dark shadow is inset from the sides and pushed down, so it only shows
+    # beneath the card and doesn't cancel the glow along the edges.
+    image.paste(Image.new("RGB", (width, height), (0, 0, 0)), (0, 0), layer(dy, blur * 0.7, opacity, inset=blur * 0.8))
+    return image
+
+
+def _make_gradient_bar(width: int, height: int, left: str, right: str) -> Image.Image:
+    """A thin horizontal gradient, used as an accent underline beneath titles."""
+    bar = Image.new("RGB", (width, height))
+    px = bar.load()
+    for x in range(width):
+        color = _hex_to_rgb(_lerp_color(left, right, x / max(width - 1, 1)))
+        for y in range(height):
+            px[x, y] = color
+    return bar
+
+
+class FadeButton(ctk.CTkButton):
+    """A CTkButton whose hover color eases in and out instead of snapping.
+
+    CTkButton's own hover is instantaneous, which reads as stiff. This turns
+    that off and cross-fades the fill itself. It keeps track of the color the
+    app last asked for, so code that recolors a button (Boost turning red, a
+    button greying out) still works while the pointer is over it.
+    """
+
+    FADE_SECONDS = 0.14
+
+    def __init__(self, master, *args, parent_bg: str = COLOR_CARD, **kwargs):
+        self._parent_bg = parent_bg
+        self._base = kwargs.get("fg_color", COLOR_ACCENT)
+        self._shown = None
+        self._hovering = False
+        self._fade_job = None
+        self._leave_job = None
+        super().__init__(master, *args, hover=False, **kwargs)
+        self._shown = self._resolve(self._base)
+        self.bind("<Enter>", self._on_enter)
+        self.bind("<Leave>", self._on_leave)
+
+    def _resolve(self, color) -> str:
+        if isinstance(color, (tuple, list)):
+            color = color[-1]
+        return (self._parent_bg if color == "transparent" else color).lower()
+
+    def _can_animate(self) -> bool:
+        try:
+            return self.winfo_toplevel().state() == "normal"
+        except tk.TclError:
+            return False
+
+    def _apply(self, color) -> None:
+        self._shown = self._resolve(color)
+        ctk.CTkButton.configure(self, fg_color=color)
+
+    def _cancel_fade(self) -> None:
+        if self._fade_job is not None:
+            self.after_cancel(self._fade_job)
+            self._fade_job = None
+
+    def _fade(self, target: str, final=None) -> None:
+        self._cancel_fade()
+        start = self._shown or self._resolve(self._base)
+        if start == target or not self._can_animate():
+            self._apply(final if final is not None else target)
+            return
+        t0 = time.monotonic()
+
+        def step() -> None:
+            progress = min((time.monotonic() - t0) / self.FADE_SECONDS, 1.0)
+            self._apply(_lerp_color(start, target, _ease_out(progress)))
+            if progress < 1.0:
+                self._fade_job = self.after(16, step)
+            else:
+                self._fade_job = None
+                if final is not None:
+                    self._apply(final)
+
+        step()
+
+    def _on_enter(self, _event=None) -> None:
+        if self._leave_job is not None:
+            self.after_cancel(self._leave_job)
+            self._leave_job = None
+        if self.cget("state") == "disabled":
+            return
+        self._hovering = True
+        self._fade(self._resolve(self.cget("hover_color")))
+
+    def _on_leave(self, _event=None) -> None:
+        # Moving between the button's inner widgets fires Leave immediately
+        # followed by Enter; the short delay stops that flickering.
+        self._leave_job = self.after(35, self._finish_leave)
+
+    def _finish_leave(self) -> None:
+        self._leave_job = None
+        if self._hovering:
+            self._hovering = False
+            self._fade(self._resolve(self._base), final=self._base)
+
+    def configure(self, require_redraw=False, **kwargs):
+        if "fg_color" in kwargs:
+            self._base = kwargs["fg_color"]
+            self._cancel_fade()
+            disabling = kwargs.get("state") == "disabled"
+            if self._hovering and not disabling and self.cget("state") != "disabled":
+                kwargs["fg_color"] = kwargs.get("hover_color") or self.cget("hover_color")
+            self._shown = self._resolve(kwargs["fg_color"])
+        elif kwargs.get("state") == "disabled" and self._hovering:
+            self._hovering = False
+            self._cancel_fade()
+            kwargs["fg_color"] = self._base
+            self._shown = self._resolve(self._base)
+        super().configure(require_redraw=require_redraw, **kwargs)
+
+
+class ShadowFrame(ctk.CTkFrame):
+    """Container that draws a soft drop shadow behind the card placed inside it.
+
+    Create the card as a child of this frame and grid it with
+    padx/pady=SHADOW_MARGIN. The shadow image is regenerated (debounced) when
+    the frame is resized, and cached per size.
+    """
+
+    def __init__(self, master, radius: int = 16):
+        super().__init__(master, fg_color=COLOR_BG, corner_radius=0)
+        self.grid_columnconfigure(0, weight=1)
+        self.grid_rowconfigure(0, weight=1)
+        self._radius = radius
+        self._size = None
+        self._job = None
+        self._image = None
+        self._shadow = ctk.CTkLabel(self, text="", fg_color=COLOR_BG)
+        self._shadow.place(x=0, y=0, relwidth=1, relheight=1)
+        self.bind("<Configure>", self._schedule_render)
+
+    def _schedule_render(self, _event=None) -> None:
+        if self._job is not None:
+            self.after_cancel(self._job)
+        self._job = self.after(60, self._render)
+
+    def _render(self) -> None:
+        self._job = None
+        width, height = self.winfo_width(), self.winfo_height()
+        if width < 60 or height < 60 or (width, height) == self._size:
+            return
+        self._size = (width, height)
+        scale = self._get_widget_scaling()
+        pil = _make_shadow_image(
+            width, height, margin=SHADOW_MARGIN * scale, radius=self._radius * scale,
+            blur=5.5 * scale, dy=7 * scale, opacity=0.6, bg=COLOR_BG,
+        )
+        self._image = ctk.CTkImage(pil, pil, size=(width / scale, height / scale))
+        self._shadow.configure(image=self._image)
+
+
 class ScrollableDropdown(ctk.CTkFrame):
     """A combo-box-style picker with a real, visible scrollbar in its popup.
 
@@ -216,7 +419,7 @@ class ScrollableDropdown(ctk.CTkFrame):
         self._dropdown_fg_color = dropdown_fg_color or fg_color
         self._dropdown_hover_color = dropdown_hover_color or button_color
 
-        self._display = ctk.CTkButton(
+        self._display = FadeButton(
             self, text=self._selected or "—", height=height, corner_radius=8,
             font=font, fg_color=fg_color, hover_color=fg_color, text_color=text_color,
             border_width=1, border_color=border_color, anchor="w",
@@ -224,7 +427,7 @@ class ScrollableDropdown(ctk.CTkFrame):
         )
         self._display.grid(row=0, column=0, sticky="ew")
 
-        self._arrow = ctk.CTkButton(
+        self._arrow = FadeButton(
             self, text="▾", width=28, height=height, corner_radius=8, font=font,
             fg_color=button_color, hover_color=button_hover_color, text_color=text_color,
             command=self._toggle_popup,
@@ -279,8 +482,8 @@ class ScrollableDropdown(ctk.CTkFrame):
         scroll_frame.grid_columnconfigure(0, weight=1)
 
         for i, value in enumerate(self._values):
-            row = ctk.CTkButton(
-                scroll_frame, text=value, height=row_height - 4, corner_radius=4,
+            row = FadeButton(
+                scroll_frame, parent_bg=self._dropdown_fg_color or COLOR_SURFACE, text=value, height=row_height - 4, corner_radius=4,
                 font=self._font, fg_color="transparent", hover_color=self._dropdown_hover_color,
                 text_color=self._text_color, anchor="w",
                 command=lambda v=value: self._pick(v),
@@ -304,6 +507,10 @@ class ScrollableDropdown(ctk.CTkFrame):
 class App(ctk.CTk):
     def __init__(self) -> None:
         super().__init__()
+        self.attributes("-alpha", 0.0)  # faded in at the end of __init__
+        self._tweens: dict = {}
+        self._bar_values: dict = {}
+        self._ambient_job = None
         self.title("Game Booster & Radio Center")
         self.geometry("980x620")
         self.minsize(840, 520)
@@ -344,6 +551,8 @@ class App(ctk.CTk):
         self._recover_from_previous_crash()
 
         self.stats_monitor.start()
+        self._fade_in()
+        self.after(2500, lambda: self.attributes("-alpha", 1.0))  # never leave the window invisible
         self.after(STATS_REFRESH_MS, self._poll_stats)
         self.after(SYNC_POLL_MS, self._poll_sync_state)
         self.protocol("WM_DELETE_WINDOW", self._on_close)
@@ -359,11 +568,114 @@ class App(ctk.CTk):
             text_color=COLOR_WARNING,
         )
 
+    # ------------------------------------------------------------ animation
+    # Everything here is cosmetic and deliberately cheap: short tweens at ~60fps
+    # that finish in a fraction of a second, plus two slow ambient effects (the
+    # Boost glow and the equalizer) that stop entirely while the window is
+    # minimized - which is where it lives during a game.
+
+    def _visible(self) -> bool:
+        try:
+            return self.state() == "normal"
+        except tk.TclError:
+            return False
+
+    def _tween(self, key: str, start: float, end: float, ms: int, apply) -> None:
+        """Ease apply(value) from start to end. A new tween with the same key replaces the old one."""
+        job = self._tweens.pop(key, None)
+        if job is not None:
+            self.after_cancel(job)
+        if ms <= 0 or not self._visible():
+            apply(end)
+            return
+        t0 = time.monotonic()
+
+        def step() -> None:
+            progress = min((time.monotonic() - t0) * 1000 / ms, 1.0)
+            apply(start + (end - start) * _ease_out(progress))
+            if progress < 1.0:
+                self._tweens[key] = self.after(16, step)
+            else:
+                self._tweens.pop(key, None)
+
+        step()
+
+    def _fade_in(self, attempt: int = 0) -> None:
+        """Fade the window in - once it is actually on screen.
+
+        CustomTkinter keeps a new window hidden for its first moments, so
+        starting the tween immediately would just snap to fully opaque.
+        """
+        if self._visible() and attempt > 0:
+            self._tween("fade", 0.0, 1.0, 320, lambda v: self.attributes("-alpha", v))
+        elif attempt < 30:
+            self.after(50, lambda: self._fade_in(attempt + 1))
+        else:
+            self.attributes("-alpha", 1.0)
+
+    def _glide_bar(self, bar: ctk.CTkProgressBar, key: str, target: float) -> None:
+        def apply(value: float) -> None:
+            self._bar_values[key] = value
+            bar.set(value)
+
+        self._tween(key, self._bar_values.get(key, 0.0), target, 700, apply)
+
+    def _title_underline(self, parent: ctk.CTkFrame, columnspan: int) -> None:
+        """A short accent gradient beneath a section title."""
+        width, height = 96, 3
+        bar = _make_gradient_bar(width * 4, height * 4, COLOR_ACCENT_LIGHT, COLOR_CARD)
+        image = ctk.CTkImage(bar, bar, size=(width, height))
+        self._underline_images = getattr(self, "_underline_images", []) + [image]
+        ctk.CTkLabel(parent, text="", image=image, height=height, fg_color="transparent").grid(
+            row=1, column=0, columnspan=columnspan, sticky="w", pady=(4, 0)
+        )
+
+    def _draw_equalizer(self, playing: bool, now: float) -> None:
+        canvas, s = self.eq_canvas, self._eq_scale
+        height = int(canvas.cget("height"))
+        bar_w, gap = int(3 * s), int(2 * s)
+        canvas.delete("all")
+        for i in range(4):
+            if playing:
+                level = 0.5 + 0.5 * math.sin(now * (4.0 + i * 1.3) + i * 1.9)
+            else:
+                level = self._eq_levels[i] * 0.55  # ease down to flat when audio stops
+            self._eq_levels[i] = level
+            bar_h = max(int(2 * s), int(level * height))
+            x0 = i * (bar_w + gap)
+            color = _lerp_color(COLOR_ACCENT, COLOR_ACCENT_LIGHT, i / 3) if playing or level > 0.1 else COLOR_BUSY
+            canvas.create_rectangle(x0, height - bar_h, x0 + bar_w, height, fill=color, width=0)
+        self._eq_moving = playing or max(self._eq_levels) > 0.08
+
+    def _ensure_ambient(self) -> None:
+        if self._ambient_job is None and self._visible():
+            self._ambient_job = self.after(60, self._ambient_tick)
+
+    def _ambient_tick(self) -> None:
+        self._ambient_job = None
+        if not self._visible():
+            return  # minimized: stop; _poll_stats revives this when the window is back
+        now = time.monotonic()
+        boosted = self.boost_state is not None and not self._unboost_in_progress
+        playing = self.radio_on and self.radio_player.is_playing()
+        if boosted:
+            glow = 0.5 + 0.5 * math.sin(now * 2.4)
+            self.boost_button.configure(border_color=_lerp_color(COLOR_DANGER, "#F07C7E", glow))
+        if playing or self._eq_moving:
+            self._draw_equalizer(playing, now)
+        if boosted or playing or self._eq_moving:
+            self._ambient_job = self.after(70, self._ambient_tick)
+
     # ---------------------------------------------------------------- layout
 
     def _build_left_pane(self) -> None:
-        left = ctk.CTkFrame(self, corner_radius=16, fg_color=COLOR_CARD)
-        left.grid(row=0, column=0, sticky="nsew", padx=(20, 10), pady=20)
+        left_shadow = ShadowFrame(self)
+        left_shadow.grid(row=0, column=0, sticky="nsew", padx=(8, 0), pady=8)
+        left = ctk.CTkFrame(
+            left_shadow, corner_radius=16, fg_color=COLOR_CARD,
+            border_width=1, border_color=COLOR_CARD_BORDER,
+        )
+        left.grid(row=0, column=0, sticky="nsew", padx=SHADOW_MARGIN, pady=SHADOW_MARGIN)
         left.grid_columnconfigure(0, weight=1)
 
         title_row = ctk.CTkFrame(left, fg_color="transparent")
@@ -390,6 +702,7 @@ class App(ctk.CTk):
             font=ctk.CTkFont(family=FONT, size=20, weight="bold"),
             text_color=COLOR_TEXT,
         ).grid(row=0, column=2)
+        self._title_underline(title_row, columnspan=3)
 
         ctk.CTkLabel(
             left,
@@ -416,7 +729,7 @@ class App(ctk.CTk):
             text_color=COLOR_TEXT,
         )
         self.game_dropdown.grid(row=0, column=0, sticky="ew")
-        ctk.CTkButton(
+        FadeButton(
             selector_row,
             text="Refresh",
             width=90,
@@ -431,7 +744,7 @@ class App(ctk.CTk):
             command=self._refresh_process_list,
         ).grid(row=0, column=1, padx=(8, 0))
 
-        self.boost_button = ctk.CTkButton(
+        self.boost_button = FadeButton(
             left,
             text="⚡ BOOST GAME",
             height=50,
@@ -544,14 +857,17 @@ class App(ctk.CTk):
         # Scrollable: a long track title or a busy listeners list pushes the
         # volume controls off the bottom, and a small window shouldn't force
         # anyone to resize it just to reach them.
+        right_shadow = ShadowFrame(self)
+        right_shadow.grid(row=0, column=1, sticky="nsew", padx=(0, 8), pady=8)
         content = ctk.CTkScrollableFrame(
-            self, corner_radius=16, fg_color=COLOR_CARD,
+            right_shadow, corner_radius=16, fg_color=COLOR_CARD,
+            border_width=1, border_color=COLOR_CARD_BORDER,
             scrollbar_fg_color=COLOR_CARD,
             scrollbar_button_color=COLOR_BUSY,
             scrollbar_button_hover_color=COLOR_ACCENT,
         )
         self.right_pane = content
-        content.grid(row=0, column=1, sticky="nsew", padx=(10, 20), pady=20)
+        content.grid(row=0, column=0, sticky="nsew", padx=SHADOW_MARGIN, pady=SHADOW_MARGIN)
         content.grid_columnconfigure(0, weight=1)
 
         title_row = ctk.CTkFrame(content, fg_color="transparent")
@@ -568,6 +884,18 @@ class App(ctk.CTk):
             text_color=COLOR_TEXT,
         ).grid(row=0, column=2)
 
+        # Live equalizer: bars move while audio is actually playing.
+        self._eq_scale = self._get_window_scaling()
+        self._eq_levels = [0.0] * 4
+        self._eq_moving = False
+        self.eq_canvas = tk.Canvas(
+            title_row, width=int(22 * self._eq_scale), height=int(16 * self._eq_scale),
+            bg=COLOR_CARD, highlightthickness=0, bd=0,
+        )
+        self.eq_canvas.grid(row=0, column=3, padx=(14, 0), pady=(6, 0))
+        self._draw_equalizer(False, 0.0)
+        self._title_underline(title_row, columnspan=4)
+
         ctk.CTkLabel(
             content, text="Connect to a room to listen with friends.",
             font=ctk.CTkFont(family=FONT, size=12), text_color=COLOR_TEXT_MUTED,
@@ -582,7 +910,7 @@ class App(ctk.CTk):
             fg_color=COLOR_SURFACE, border_color=COLOR_BORDER, text_color=COLOR_TEXT,
         )
         self.server_entry.grid(row=0, column=0, sticky="ew")
-        self.connect_button = ctk.CTkButton(
+        self.connect_button = FadeButton(
             connect_row, text="Connect", width=100, height=36, corner_radius=8,
             font=ctk.CTkFont(family=FONT, size=13),
             fg_color=COLOR_ACCENT, hover_color=COLOR_ACCENT_HOVER, text_color=COLOR_BUTTON_TEXT,
@@ -637,7 +965,7 @@ class App(ctk.CTk):
             fg_color=COLOR_SURFACE, border_color=COLOR_BORDER, text_color=COLOR_TEXT,
         )
         self.track_entry.grid(row=0, column=0, sticky="ew")
-        self.track_action_button = ctk.CTkButton(
+        self.track_action_button = FadeButton(
             track_row, text="Play Locally", width=110, height=36, corner_radius=8,
             font=ctk.CTkFont(family=FONT, size=13),
             fg_color=COLOR_ACCENT, hover_color=COLOR_ACCENT_HOVER, text_color=COLOR_BUTTON_TEXT,
@@ -648,7 +976,7 @@ class App(ctk.CTk):
         playback_row = ctk.CTkFrame(content, fg_color="transparent")
         playback_row.grid(row=10, column=0, sticky="ew", padx=20, pady=(8, 4))
         playback_row.grid_columnconfigure((0, 1), weight=1)
-        self.play_pause_button = ctk.CTkButton(
+        self.play_pause_button = FadeButton(
             playback_row, text="▶ Play", height=36, corner_radius=8,
             font=ctk.CTkFont(family=FONT, size=13),
             fg_color="transparent", hover_color=COLOR_SURFACE,
@@ -656,7 +984,7 @@ class App(ctk.CTk):
             state="disabled", command=self._on_play_pause_clicked,
         )
         self.play_pause_button.grid(row=0, column=0, sticky="ew", padx=(0, 4))
-        self.skip_button = ctk.CTkButton(
+        self.skip_button = FadeButton(
             playback_row, text="⏭ Next", height=36, corner_radius=8,
             font=ctk.CTkFont(family=FONT, size=13),
             fg_color="transparent", hover_color=COLOR_SURFACE,
@@ -820,7 +1148,9 @@ class App(ctk.CTk):
                 self.boost_button.configure(
                     state="normal", text="⏹ UN-BOOST",
                     fg_color=COLOR_DANGER, hover_color=COLOR_DANGER_HOVER,
+                    border_width=2, border_color=COLOR_DANGER,
                 )
+                self._ensure_ambient()
                 # Keep listening: the temp-cleanup result follows shortly.
                 self.after(QUEUE_POLL_MS, self._poll_boost_queue)
         elif kind == "temp_done":
@@ -843,6 +1173,7 @@ class App(ctk.CTk):
             self.boost_button.configure(
                 state="normal", text="⚡ BOOST GAME",
                 fg_color=COLOR_ACCENT, hover_color=COLOR_ACCENT_HOVER,
+                border_width=0,
             )
 
     def _auto_unboost(self) -> None:
@@ -864,17 +1195,19 @@ class App(ctk.CTk):
         # (which is where it lives during a game), so skip redrawing them and
         # slow the sampler down too - fewer wakeups on the game's cores.
         hidden = self.state() in ("iconic", "withdrawn")
+        if not hidden:
+            self._ensure_ambient()  # revives glow/equalizer after a minimize
         self.stats_monitor.interval_seconds = 5.0 if hidden else 1.0
         stats = None if hidden else self.stats_monitor.get_latest()
         if stats is not None:
             self.cpu_label.configure(text=f"CPU: {stats.cpu_percent:.0f}%")
-            self.cpu_bar.set(stats.cpu_percent / 100)
+            self._glide_bar(self.cpu_bar, "cpu", stats.cpu_percent / 100)
             self.cpu_bar.configure(progress_color=_load_bar_color(stats.cpu_percent))
 
             self.ram_label.configure(
                 text=f"RAM: {stats.ram_percent:.0f}% ({stats.ram_used_gb:.1f} / {stats.ram_total_gb:.1f} GB)"
             )
-            self.ram_bar.set(stats.ram_percent / 100)
+            self._glide_bar(self.ram_bar, "ram", stats.ram_percent / 100)
             self.ram_bar.configure(progress_color=_load_bar_color(stats.ram_percent))
         self.after(STATS_HIDDEN_REFRESH_MS if hidden else STATS_REFRESH_MS, self._poll_stats)
 
@@ -1240,7 +1573,7 @@ class App(ctk.CTk):
             ).grid(row=0, column=0, sticky="w")
 
             if i_am_admin and user["role"] != "admin":
-                ctk.CTkButton(
+                FadeButton(
                     row_frame, text="Promote", width=70, height=24, corner_radius=6,
                     font=ctk.CTkFont(family=FONT, size=11),
                     fg_color="transparent", hover_color=COLOR_SURFACE,
