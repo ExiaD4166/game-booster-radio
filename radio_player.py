@@ -159,10 +159,17 @@ class RadioPlayer:
     """
 
     def __init__(self, volume: int = 70) -> None:
-        self._instance = vlc.Instance("--no-video", "--quiet")
+        # network-caching: a 3s read-ahead buffer (VLC's default is 1s) rides
+        # out the brief network dips that happen while a game is using the
+        # connection - smoothness matters more here than join latency.
+        # http-reconnect: resume a dropped YouTube stream instead of stalling.
+        self._instance = vlc.Instance(
+            "--no-video", "--quiet", "--network-caching=3000", "--http-reconnect"
+        )
         self._player = self._instance.media_player_new()
         self.title: str | None = None
         self.duration_seconds: float | None = None
+        self._rate = 1.0
         self.set_volume(volume)
 
     def load(self, youtube_url: str) -> dict:
@@ -170,6 +177,11 @@ class RadioPlayer:
         info = extract_audio_url(youtube_url)
         media = self._instance.media_new(info["url"])
         self._player.set_media(media)
+        # media_new() hands us a reference we own; the player took its own
+        # when set_media() ran, so release ours now or every track played
+        # leaks one libvlc media object for the life of the app.
+        media.release()
+        self._rate = 1.0  # a freshly loaded track always starts at normal speed
         self.title = info["title"]
         self.duration_seconds = info["duration"]
         return info
@@ -208,6 +220,25 @@ class RadioPlayer:
 
     def seek(self, position_seconds: float) -> None:
         self._player.set_time(int(position_seconds * 1000))
+
+    def get_rate(self) -> float:
+        return self._rate
+
+    def set_rate(self, rate: float) -> bool:
+        """Change playback speed (VLC time-stretches, so pitch is preserved).
+
+        Used for gentle drift correction: playing a few percent fast or slow
+        closes a small gap smoothly, where a seek on a network stream has to
+        re-buffer. Returns True if the speed is now `rate`; False if VLC
+        couldn't apply it yet (e.g. nothing is playing) - the caller just
+        tries again on its next tick.
+        """
+        if abs(rate - self._rate) < 0.001:
+            return True
+        if self._player.set_rate(rate) == 0:
+            self._rate = rate
+            return True
+        return False
 
     def set_volume(self, percent: int) -> None:
         self._player.audio_set_volume(max(0, min(100, percent)))

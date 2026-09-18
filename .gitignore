@@ -27,3 +27,6 @@ Thumbs.db
 # Private learning docs (not for the public repo)
 LEARNING_ROADMAP.md
 LEARNING_CONCEPTS.md
+
+# Private analysis notes (not for the public repo)
+OPTIMIZATION_AND_BUG_REPORT.md

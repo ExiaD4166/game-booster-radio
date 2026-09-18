@@ -14,6 +14,7 @@ import asyncio
 import json
 import logging
 import threading
+import time
 
 import websockets
 
@@ -124,6 +125,9 @@ class SyncClient:
         except json.JSONDecodeError:
             return
         if data.get("type") == "state":
+            # When it arrived, so consumers can tell how old its 'position'
+            # is: the server only broadcasts every few seconds.
+            data["_received_at"] = time.monotonic()
             with self._lock:
                 self._latest_state = data
 

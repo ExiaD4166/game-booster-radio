@@ -28,17 +28,23 @@ ctk.set_default_color_theme("dark-blue")
 STATS_REFRESH_MS = 1000
 QUEUE_POLL_MS = 100
 SYNC_POLL_MS = 500
-# A real network audio stream needs more tolerance than a plain number
-# might suggest: VLC periodically buffers, and during that window position
-# doesn't advance even though the server's wall-clock position keeps
-# ticking. 1.5s (closer to the original spec figure) fired constantly
-# against normal buffering blips, and since a network seek itself takes a
-# moment to settle, back-to-back corrections could overshoot and undershoot
-# repeatedly, audible as constant forward/backward skipping. Loosened to
-# 3.0s, and paired with a cooldown so a just-issued correction has time to
-# actually take effect before another one can fire.
-DRIFT_THRESHOLD_SECONDS = 3.0
-DRIFT_CORRECTION_COOLDOWN_SECONDS = 6.0
+STATS_HIDDEN_REFRESH_MS = 5000
+# Drift correction, gentlest tool first. A real network stream buffers now
+# and then (position stalls while the server's clock keeps ticking) and a
+# seek on it forces a re-buffer that is audible as a hitch - and back-to-back
+# seeks can overshoot each other, which once sounded like constant skipping.
+# So small drift is closed by playing a few percent fast or slow (VLC
+# time-stretches, so pitch is unchanged) and a hard seek is kept for large
+# gaps, with a cooldown so one seek can settle before another may fire.
+# Hysteresis (start at 1.0s, stop at 0.4s) stops it flapping around the edge.
+DRIFT_NUDGE_START_SECONDS = 1.0
+DRIFT_NUDGE_STOP_SECONDS = 0.4
+DRIFT_NUDGE_RATE = 0.05
+# Right after joining, one seek is fine (playback just started, so there is
+# nothing to interrupt) - this is what puts a mid-track joiner in the right place.
+DRIFT_JOIN_SEEK_THRESHOLD_SECONDS = 1.0
+DRIFT_SEEK_THRESHOLD_SECONDS = 6.0
+DRIFT_SEEK_COOLDOWN_SECONDS = 6.0
 DEFAULT_SERVER_URI = "ws://localhost:8765"
 
 ASSETS_DIR = Path(__file__).parent / "assets"
@@ -155,6 +161,22 @@ def _format_bytes(n: int) -> str:
     if mb >= 1:
         return f"{mb:.0f} MB"
     return f"{n / 1024:.0f} KB"
+
+
+def _server_position_now(state: dict) -> float:
+    """Where the shared stream is RIGHT NOW, not when the state was sent.
+
+    The server broadcasts its position every few seconds, so a state message
+    can be seconds old by the time it's used. Comparing that stale number to
+    the live local position made a perfectly in-sync listener look up to
+    3 seconds behind. While the stream is playing the position advances in
+    real time, so add the time since the message arrived.
+    """
+    position = state.get("position", 0.0)
+    received_at = state.get("_received_at")
+    if state.get("is_playing") and received_at is not None:
+        position += time.monotonic() - received_at
+    return position
 
 
 class ScrollableDropdown(ctk.CTkFrame):
@@ -311,6 +333,11 @@ class App(ctk.CTk):
         self._local_queue_index: int = 0
         self._synced_queue_position: tuple[int, int] | None = None
         self._loading_track = False
+        self.game_watcher: optimizer.GameExitWatcher | None = None
+        self._join_align_pending = False
+        self._unboost_in_progress = False
+        self._unboost_note: str | None = None
+        self._boost_base_text = ""
 
         self._build_left_pane()
         self._build_right_pane()
@@ -422,6 +449,8 @@ class App(ctk.CTk):
             text="Idle — no game boosted.",
             font=ctk.CTkFont(family=FONT, size=12),
             text_color=COLOR_TEXT_MUTED,
+            wraplength=400,
+            justify="left",
         )
         self.status_label.grid(row=4, column=0, sticky="w", padx=20)
 
@@ -707,75 +736,131 @@ class App(ctk.CTk):
         self.status_label.configure(text=f"Boosting '{target}'...", text_color=COLOR_TEXT_MUTED)
 
         def worker() -> None:
-            state = optimizer.optimize_for_game(target)
-            # Only worth clearing temp junk on an actual successful boost —
-            # skip it if the game process vanished before we could touch it.
-            temp_stats = optimizer.clear_temp_folders() if state is not None else None
-            self._boost_queue.put(("boost_done", target, state, temp_stats))
+            try:
+                state = optimizer.optimize_for_game(target)
+                reason = None if state is not None else optimizer.explain_boost_failure(target)
+            except Exception:
+                # Never leave the button stuck on "Boosting..." if something
+                # unexpected goes wrong - report it as a plain failure.
+                logger.exception("Boost failed unexpectedly")
+                state, reason = None, "unknown"
+            self._boost_queue.put(("boost_done", target, state, reason))
+            if state is not None:
+                # Reported separately, after the boost is already in effect:
+                # the cleanup runs in Windows' low-priority background mode and
+                # may take a while - the boost itself never waits on the disk.
+                try:
+                    stats = optimizer.clear_temp_folders()
+                except Exception:
+                    logger.exception("Temp cleanup failed")
+                    stats = {"files_removed": 0, "bytes_freed": 0}
+                self._boost_queue.put(("temp_done", target, state, stats))
 
         threading.Thread(target=worker, daemon=True).start()
         self.after(QUEUE_POLL_MS, self._poll_boost_queue)
 
     def _start_unboost(self) -> None:
+        self._unboost_in_progress = True
         self.boost_button.configure(
             state="disabled", text="Restoring...", fg_color=COLOR_BUSY, hover_color=COLOR_BUSY
         )
+        if self.game_watcher is not None:
+            self.game_watcher.stop()
+            self.game_watcher = None
 
         state = self.boost_state
 
         def worker() -> None:
-            optimizer.restore_defaults(state)
-            self._boost_queue.put(("unboost_done", None, None, None))
+            try:
+                optimizer.restore_defaults(state)
+            except Exception:
+                logger.exception("Restore failed unexpectedly")
+            finally:
+                self._boost_queue.put(("unboost_done", None, None, None))
 
         threading.Thread(target=worker, daemon=True).start()
         self.after(QUEUE_POLL_MS, self._poll_boost_queue)
 
     def _poll_boost_queue(self) -> None:
         try:
-            kind, target, state, temp_stats = self._boost_queue.get_nowait()
+            kind, target, state, extra = self._boost_queue.get_nowait()
         except queue.Empty:
             self.after(QUEUE_POLL_MS, self._poll_boost_queue)
             return
 
         if kind == "boost_done":
             if state is None:
-                self.status_label.configure(
-                    text=f"Could not boost '{target}'. Is it still running?", text_color=COLOR_WARNING
-                )
+                if extra == "needs_admin":
+                    text = (
+                        f"'{target}' runs as administrator, so Windows won't let Game Booster "
+                        "change it. Restart Game Booster as administrator to boost it."
+                    )
+                else:
+                    text = f"Could not boost '{target}'. Is it still running?"
+                self.status_label.configure(text=text, text_color=COLOR_WARNING)
                 self.boost_button.configure(
                     state="normal", text="⚡ BOOST GAME",
                     fg_color=COLOR_ACCENT, hover_color=COLOR_ACCENT_HOVER,
                 )
             else:
                 self.boost_state = state
-                temp_note = ""
-                if temp_stats and temp_stats["files_removed"] > 0:
-                    count = temp_stats["files_removed"]
-                    noun = "temp file" if count == 1 else "temp files"
-                    temp_note = f" Cleared {count} {noun} ({_format_bytes(temp_stats['bytes_freed'])})."
-                self.status_label.configure(
-                    text=(
-                        f"Boosted '{target}' — {len(state.original_priorities)} "
-                        f"background processes lowered.{temp_note}"
-                    ),
-                    text_color=COLOR_SUCCESS,
+                self.game_watcher = optimizer.GameExitWatcher(state.game_pid)
+                self.game_watcher.start()
+                power_note = " High Performance power plan on." if state.original_power_scheme else ""
+                self._boost_base_text = (
+                    f"Boosted '{target}' — {len(state.original_priorities)} "
+                    f"background processes lowered.{power_note}"
                 )
+                self.status_label.configure(text=self._boost_base_text, text_color=COLOR_SUCCESS)
                 self.boost_button.configure(
                     state="normal", text="⏹ UN-BOOST",
                     fg_color=COLOR_DANGER, hover_color=COLOR_DANGER_HOVER,
                 )
+                # Keep listening: the temp-cleanup result follows shortly.
+                self.after(QUEUE_POLL_MS, self._poll_boost_queue)
+        elif kind == "temp_done":
+            if self.boost_state is not None and not self._unboost_in_progress:
+                count = extra["files_removed"]
+                if count > 0:
+                    noun = "temp file" if count == 1 else "temp files"
+                    self.status_label.configure(
+                        text=f"{self._boost_base_text} Cleared {count} {noun} "
+                             f"({_format_bytes(extra['bytes_freed'])}).",
+                        text_color=COLOR_SUCCESS,
+                    )
         elif kind == "unboost_done":
             self.boost_state = None
-            self.status_label.configure(text="Idle — no game boosted.", text_color=COLOR_TEXT_MUTED)
+            self._unboost_in_progress = False
+            note, self._unboost_note = self._unboost_note, None
+            self.status_label.configure(
+                text=note or "Idle — no game boosted.", text_color=COLOR_TEXT_MUTED
+            )
             self.boost_button.configure(
                 state="normal", text="⚡ BOOST GAME",
                 fg_color=COLOR_ACCENT, hover_color=COLOR_ACCENT_HOVER,
             )
 
+    def _auto_unboost(self) -> None:
+        """The boosted game exited on its own: put everything back right away."""
+        self._unboost_note = "Game closed — everything restored automatically."
+        self._start_unboost()
+
     # ------------------------------------------------------------- polling
 
     def _poll_stats(self) -> None:
-        stats = self.stats_monitor.get_latest()
+        watcher = self.game_watcher
+        if (
+            watcher is not None and watcher.exited.is_set()
+            and self.boost_state is not None and not self._unboost_in_progress
+        ):
+            self._auto_unboost()
+
+        # Nobody is looking at these numbers while the window is minimized
+        # (which is where it lives during a game), so skip redrawing them and
+        # slow the sampler down too - fewer wakeups on the game's cores.
+        hidden = self.state() in ("iconic", "withdrawn")
+        self.stats_monitor.interval_seconds = 5.0 if hidden else 1.0
+        stats = None if hidden else self.stats_monitor.get_latest()
         if stats is not None:
             self.cpu_label.configure(text=f"CPU: {stats.cpu_percent:.0f}%")
             self.cpu_bar.set(stats.cpu_percent / 100)
@@ -786,7 +871,7 @@ class App(ctk.CTk):
             )
             self.ram_bar.set(stats.ram_percent / 100)
             self.ram_bar.configure(progress_color=_load_bar_color(stats.ram_percent))
-        self.after(STATS_REFRESH_MS, self._poll_stats)
+        self.after(STATS_HIDDEN_REFRESH_MS if hidden else STATS_REFRESH_MS, self._poll_stats)
 
     # --------------------------------------------------------------- sync UI
 
@@ -838,7 +923,7 @@ class App(ctk.CTk):
         sync_active = state.get("sync_active", False)
         track_url = state.get("track_url")
         server_is_playing = state.get("is_playing", False)
-        server_position = state.get("position", 0.0)
+        server_position = _server_position_now(state)
 
         self._update_users_list(state.get("users", []))
         self._synced_queue_position = (
@@ -853,25 +938,28 @@ class App(ctk.CTk):
                 self._loaded_track_url = track_url
                 self._auto_skip_track_url = None
                 self._start_load_track(
-                    track_url, seek_to=server_position, autoplay=server_is_playing and self.radio_on
+                    track_url, autoplay=server_is_playing and self.radio_on
                 )
-            elif self._is_synced_playback and self.radio_on:
+            elif self._is_synced_playback and self.radio_on and not self._loading_track:
+                # (Nothing to do while a track is still loading: the player is
+                # empty, so there is no position to correct and any seek or
+                # play() would just be thrown away.)
                 # A playlist track that's played through to the end looks the
                 # same to VLC as one that's simply paused (is_playing() is
                 # False either way) — checked first so the block below
                 # doesn't try to restart the just-ended track from the top
                 # instead of letting it advance to the next one.
                 ended = self.radio_player.is_ended()
-                if is_admin and ended and not self._loading_track and state.get("queue_length", 0) > 1:
+                if is_admin and ended and state.get("queue_length", 0) > 1:
                     if self._auto_skip_track_url != self._loaded_track_url:
                         self._auto_skip_track_url = self._loaded_track_url
                         self.sync_client.send({"type": "skip"})
-                elif not (ended and self._loading_track):
+                else:
                     if server_is_playing and not self.radio_player.is_playing() and not ended:
                         self.radio_player.play()
                     elif not server_is_playing and self.radio_player.is_playing():
                         self.radio_player.pause()
-                    self._correct_drift(server_position)
+                    self._correct_drift(server_position, server_is_playing)
 
             self._set_track_entry_mode(
                 is_admin, "Paste a YouTube link..." if is_admin else "An admin stream is live"
@@ -899,20 +987,41 @@ class App(ctk.CTk):
             self._set_button_state(self.play_pause_button, "normal" if self._loaded_track_url else "disabled")
             self._set_local_skip_button_state()
 
-    def _correct_drift(self, server_position: float) -> None:
+    def _correct_drift(self, server_position: float, playing: bool = True) -> None:
         if self.radio_player.is_buffering():
             return  # position reading is unreliable mid-buffer; don't chase it
 
-        now = time.monotonic()
-        if now - self._last_drift_correction < DRIFT_CORRECTION_COOLDOWN_SECONDS:
-            return  # give the last correction time to actually settle first
+        if self._join_align_pending and not self.radio_player.is_playing():
+            return  # still opening/starting - a seek now would be ignored
 
-        local_position = self.radio_player.get_position_seconds()
-        if abs(local_position - server_position) > DRIFT_THRESHOLD_SECONDS:
+        drift = server_position - self.radio_player.get_position_seconds()  # + = we're behind
+
+        if self._join_align_pending:
+            self._join_align_pending = False
+            if abs(drift) > DRIFT_JOIN_SEEK_THRESHOLD_SECONDS:
+                self.radio_player.seek(server_position)
+                self.radio_player.set_rate(1.0)
+                self._last_drift_correction = time.monotonic()
+                return
+
+        if abs(drift) > DRIFT_SEEK_THRESHOLD_SECONDS:
+            now = time.monotonic()
+            if now - self._last_drift_correction < DRIFT_SEEK_COOLDOWN_SECONDS:
+                return  # give the last seek time to actually settle first
             self.radio_player.seek(server_position)
+            self.radio_player.set_rate(1.0)
             self._last_drift_correction = now
+            return
 
-    def _start_load_track(self, url: str, seek_to: float = 0.0, autoplay: bool = True) -> None:
+        if not playing:
+            self.radio_player.set_rate(1.0)  # nothing to catch up while paused
+        elif abs(drift) >= DRIFT_NUDGE_START_SECONDS:
+            self.radio_player.set_rate(1.0 + DRIFT_NUDGE_RATE if drift > 0 else 1.0 - DRIFT_NUDGE_RATE)
+        elif abs(drift) <= DRIFT_NUDGE_STOP_SECONDS:
+            self.radio_player.set_rate(1.0)
+        # in between: keep doing whatever we're already doing (hysteresis)
+
+    def _start_load_track(self, url: str, autoplay: bool = True) -> None:
         self.track_label.configure(text=f"Loading '{url}'...")
         # The player still reports the PREVIOUS track as Ended until the new
         # one finishes loading; auto-advance must not read that as another end.
@@ -921,16 +1030,16 @@ class App(ctk.CTk):
         def worker() -> None:
             try:
                 info = self.radio_player.load(url)
-                self._track_load_queue.put(("load_done", info, seek_to, autoplay, None))
-            except radio_player.ExtractionError as exc:
-                self._track_load_queue.put(("load_failed", None, None, None, str(exc)))
+                self._track_load_queue.put(("load_done", info, autoplay, None))
+            except Exception as exc:  # ExtractionError, or anything VLC/yt-dlp throws
+                self._track_load_queue.put(("load_failed", None, None, str(exc)))
 
         threading.Thread(target=worker, daemon=True).start()
         self.after(QUEUE_POLL_MS, self._poll_track_load_queue)
 
     def _poll_track_load_queue(self) -> None:
         try:
-            kind, info, seek_to, autoplay, error = self._track_load_queue.get_nowait()
+            kind, info, autoplay, error = self._track_load_queue.get_nowait()
         except queue.Empty:
             self.after(QUEUE_POLL_MS, self._poll_track_load_queue)
             return
@@ -955,7 +1064,7 @@ class App(ctk.CTk):
             self._local_queue = urls
             self._local_queue_index = 0
             self._loaded_track_url = urls[0]
-            self._start_load_track(urls[0], seek_to=0.0, autoplay=True)
+            self._start_load_track(urls[0], autoplay=True)
             return
 
         if kind in ("load_done", "load_failed"):
@@ -963,10 +1072,13 @@ class App(ctk.CTk):
 
         if kind == "load_done":
             self.track_label.configure(text=f"Now playing{self._queue_position_text()}: {info['title']}")
-            if seek_to:
-                self.radio_player.seek(seek_to)
             if autoplay:
                 self.radio_player.play()
+                # VLC silently ignores a seek made before a network stream has
+                # started playing (measured: a listener joining mid-track just
+                # started from 0:00), so the join alignment is deferred until
+                # playback is actually running - see _correct_drift().
+                self._join_align_pending = self._is_synced_playback
             self.play_pause_button.configure(text="⏸ Pause" if autoplay else "▶ Play")
             if not self._is_synced_playback:
                 # A locally-driven load (no admin stream involved) — this is
@@ -1018,9 +1130,9 @@ class App(ctk.CTk):
         def worker() -> None:
             try:
                 urls = radio_player.resolve_track_urls(url)
-                self._track_load_queue.put(("local_playlist_resolved", urls, None, None, None))
-            except radio_player.ExtractionError as exc:
-                self._track_load_queue.put(("load_failed", None, None, None, str(exc)))
+                self._track_load_queue.put(("local_playlist_resolved", urls, None, None))
+            except Exception as exc:  # ExtractionError, or anything VLC/yt-dlp throws
+                self._track_load_queue.put(("load_failed", None, None, str(exc)))
 
         threading.Thread(target=worker, daemon=True).start()
         self.after(QUEUE_POLL_MS, self._poll_track_load_queue)
@@ -1031,7 +1143,7 @@ class App(ctk.CTk):
         self._local_queue_index = (self._local_queue_index + 1) % len(self._local_queue)
         next_url = self._local_queue[self._local_queue_index]
         self._loaded_track_url = next_url
-        self._start_load_track(next_url, seek_to=0.0, autoplay=True)
+        self._start_load_track(next_url, autoplay=True)
 
     def _resolve_and_sync_playlist(self, url: str) -> None:
         """Expand a playlist link to its videos, then sync the whole thing.
@@ -1048,9 +1160,9 @@ class App(ctk.CTk):
         def worker() -> None:
             try:
                 urls = radio_player.resolve_track_urls(url)
-                self._track_load_queue.put(("playlist_resolved", urls, None, None, None))
-            except radio_player.ExtractionError as exc:
-                self._track_load_queue.put(("load_failed", None, None, None, str(exc)))
+                self._track_load_queue.put(("playlist_resolved", urls, None, None))
+            except Exception as exc:  # ExtractionError, or anything VLC/yt-dlp throws
+                self._track_load_queue.put(("load_failed", None, None, str(exc)))
 
         threading.Thread(target=worker, daemon=True).start()
         self.after(QUEUE_POLL_MS, self._poll_track_load_queue)
@@ -1139,7 +1251,7 @@ class App(ctk.CTk):
                 if self._is_synced_playback and self.sync_client is not None:
                     state = self.sync_client.get_latest_state()
                     if state is not None:
-                        self._correct_drift(state.get("position", 0.0))
+                        self._correct_drift(_server_position_now(state), state.get("is_playing", False))
         else:
             self.radio_player.pause()
 
@@ -1150,6 +1262,8 @@ class App(ctk.CTk):
 
     def _on_close(self) -> None:
         self.stats_monitor.stop()
+        if self.game_watcher is not None:
+            self.game_watcher.stop()
         if self.boost_state is not None:
             optimizer.restore_defaults(self.boost_state)
         if self.sync_client is not None:
