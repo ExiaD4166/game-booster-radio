@@ -541,16 +541,21 @@ class App(ctk.CTk):
         self._set_button_state(self.skip_button, "normal" if len(self._local_queue) > 1 else "disabled")
 
     def _build_right_pane(self) -> None:
-        # A plain frame, matching the left pane's proven layout pattern —
-        # CTkScrollableFrame's inner content did not stretch to fill the
-        # viewport width here, silently clipping the rightmost widgets with
-        # no horizontal scrollbar to reveal them.
-        content = ctk.CTkFrame(self, corner_radius=16, fg_color=COLOR_CARD)
+        # Scrollable: a long track title or a busy listeners list pushes the
+        # volume controls off the bottom, and a small window shouldn't force
+        # anyone to resize it just to reach them.
+        content = ctk.CTkScrollableFrame(
+            self, corner_radius=16, fg_color=COLOR_CARD,
+            scrollbar_fg_color=COLOR_CARD,
+            scrollbar_button_color=COLOR_BUSY,
+            scrollbar_button_hover_color=COLOR_ACCENT,
+        )
+        self.right_pane = content
         content.grid(row=0, column=1, sticky="nsew", padx=(10, 20), pady=20)
         content.grid_columnconfigure(0, weight=1)
 
         title_row = ctk.CTkFrame(content, fg_color="transparent")
-        title_row.grid(row=0, column=0, sticky="w", padx=20, pady=(20, 4))
+        title_row.grid(row=0, column=0, sticky="w", padx=20, pady=(4, 4))
         ctk.CTkLabel(title_row, text="📻", font=ctk.CTkFont(size=22)).grid(
             row=0, column=0, padx=(0, 8)
         )
