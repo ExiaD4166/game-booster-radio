@@ -158,6 +158,7 @@ class App(ctk.CTk):
         self._loaded_track_url: str | None = None
         self._is_synced_playback = False
         self._track_load_queue: queue.Queue = queue.Queue()
+        self._users_list_snapshot: tuple | None = None
 
         self._build_left_pane()
         self._build_right_pane()
@@ -309,8 +310,40 @@ class App(ctk.CTk):
         return ctk.CTkFrame(parent, height=1, fg_color=COLOR_BORDER)
 
     def _set_sync_badge(self, text: str, text_color: str, bg_color: str) -> None:
-        self.sync_badge_label.configure(text=text, text_color=text_color)
-        self.sync_badge.configure(fg_color=bg_color)
+        if self.sync_badge_label.cget("text") != text:
+            self.sync_badge_label.configure(text=text, text_color=text_color)
+        if self.sync_badge.cget("fg_color") != bg_color:
+            self.sync_badge.configure(fg_color=bg_color)
+
+    def _set_track_entry_mode(self, editable: bool, placeholder: str) -> None:
+        """Only reconfigure the entry when its target state actually changes.
+
+        _apply_sync_state() runs every 500ms via the sync poll loop.
+        Unconditionally calling .configure() on a live text entry that often
+        visually disrupts whatever the user is mid-typing or mid-pasting into
+        it — even though the value being set is usually identical to what's
+        already there. Querying the widget's actual current state first
+        avoids ever touching it when nothing really changed.
+        """
+        target_state = "normal" if editable else "disabled"
+        updates = {}
+        if self.track_entry.cget("state") != target_state:
+            updates["state"] = target_state
+        if self.track_entry.cget("placeholder_text") != placeholder:
+            updates["placeholder_text"] = placeholder
+        if updates:
+            self.track_entry.configure(**updates)
+
+    @staticmethod
+    def _set_button_state(button: ctk.CTkButton, state: str, text: str | None = None) -> None:
+        """Same reasoning as _set_track_entry_mode, applied to buttons."""
+        updates = {}
+        if button.cget("state") != state:
+            updates["state"] = state
+        if text is not None and button.cget("text") != text:
+            updates["text"] = text
+        if updates:
+            button.configure(**updates)
 
     def _build_right_pane(self) -> None:
         # A plain frame, matching the left pane's proven layout pattern —
@@ -630,13 +663,12 @@ class App(ctk.CTk):
                     self.radio_player.pause()
                 self._correct_drift(server_position)
 
-            self.track_entry.configure(
-                state="normal" if is_admin else "disabled",
-                placeholder_text="Paste a YouTube link..." if is_admin else "An admin stream is live",
+            self._set_track_entry_mode(
+                is_admin, "Paste a YouTube link..." if is_admin else "An admin stream is live"
             )
-            self.track_action_button.configure(text="Sync for Everyone", state="normal" if is_admin else "disabled")
-            self.play_pause_button.configure(state="normal" if is_admin else "disabled")
-            self.skip_button.configure(state="normal" if is_admin else "disabled")
+            self._set_button_state(self.track_action_button, "normal" if is_admin else "disabled", "Sync for Everyone")
+            self._set_button_state(self.play_pause_button, "normal" if is_admin else "disabled")
+            self._set_button_state(self.skip_button, "normal" if is_admin else "disabled")
         else:
             if self._is_synced_playback:
                 self.radio_player.stop()
@@ -645,12 +677,12 @@ class App(ctk.CTk):
                 self.track_label.configure(text="No track loaded.")
 
             self._set_sync_badge("🎧 LOCAL PLAYER MODE", COLOR_ACCENT_LIGHT, COLOR_BADGE_BG_ACCENT)
-            self.track_entry.configure(state="normal", placeholder_text="Paste a YouTube link...")
-            self.track_action_button.configure(
-                text="Sync for Everyone" if is_admin else "Play Locally", state="normal"
+            self._set_track_entry_mode(True, "Paste a YouTube link...")
+            self._set_button_state(
+                self.track_action_button, "normal", "Sync for Everyone" if is_admin else "Play Locally"
             )
-            self.play_pause_button.configure(state="normal" if self._loaded_track_url else "disabled")
-            self.skip_button.configure(state="disabled")
+            self._set_button_state(self.play_pause_button, "normal" if self._loaded_track_url else "disabled")
+            self._set_button_state(self.skip_button, "disabled")
 
     def _correct_drift(self, server_position: float) -> None:
         local_position = self.radio_player.get_position_seconds()
@@ -735,6 +767,24 @@ class App(ctk.CTk):
             self.sync_client.send({"type": "promote", "target_id": user_id})
 
     def _update_users_list(self, users: list[dict]) -> None:
+        """Rebuild the listener list — but only when it actually changed.
+
+        This is called from _apply_sync_state() on every 500ms poll tick.
+        Unconditionally destroying and recreating every widget here that
+        often caused a constant visible flicker (and, worse, a layout
+        reflow of everything below it in the same column — the track entry
+        and buttons — that could interrupt an in-progress paste). Skipping
+        the rebuild entirely when nothing changed fixes both.
+        """
+        my_state = self.sync_client.get_latest_state() if self.sync_client else None
+        my_id = my_state.get("your_id") if my_state else None
+        i_am_admin = bool(my_state and my_state.get("your_role") == "admin")
+
+        snapshot = (i_am_admin, my_id, tuple((u["id"], u["name"], u["role"]) for u in users))
+        if snapshot == self._users_list_snapshot:
+            return
+        self._users_list_snapshot = snapshot
+
         for widget in self.users_frame.winfo_children():
             widget.destroy()
 
@@ -744,10 +794,6 @@ class App(ctk.CTk):
                 font=ctk.CTkFont(family=FONT, size=12), text_color=COLOR_TEXT_MUTED,
             ).grid(row=0, column=0, sticky="w")
             return
-
-        my_state = self.sync_client.get_latest_state() if self.sync_client else None
-        my_id = my_state.get("your_id") if my_state else None
-        i_am_admin = bool(my_state and my_state.get("your_role") == "admin")
 
         for row, user in enumerate(users):
             row_frame = ctk.CTkFrame(self.users_frame, fg_color="transparent")

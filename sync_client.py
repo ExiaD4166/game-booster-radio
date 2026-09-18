@@ -89,7 +89,11 @@ class SyncClient:
     async def _connect_loop(self) -> None:
         while not self._stop_event.is_set():
             try:
-                async with websockets.connect(self.uri, open_timeout=5) as ws:
+                # Generous timeout: a free-tier host (Render's free plan, for
+                # instance) can take 30-60+ seconds to cold-start from asleep,
+                # and a too-short timeout here just causes a rapid, visible
+                # connect/fail/retry loop while it's waking up.
+                async with websockets.connect(self.uri, open_timeout=45) as ws:
                     self._ws = ws
                     with self._lock:
                         self._connected = True
