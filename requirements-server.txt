@@ -1,0 +1,5 @@
+# Minimal dependencies for the deployed sync server (server.py) only.
+# The desktop app needs the full requirements.txt (GUI, audio, etc.) — this
+# file is what actually runs on a headless server, kept lean on purpose.
+
+websockets==17.1
